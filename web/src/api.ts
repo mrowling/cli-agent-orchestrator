@@ -90,9 +90,33 @@ export interface AgentProfileInfo {
   name: string
   description: string
   source: AgentProfileSource
+  // Whether load_agent_profile() would accept this entry.
+  loadable?: boolean
+  role?: string
+  capabilities?: string[]
+  tags?: string[]
   // Other enabled directories that also define this profile name (the winner
   // above is what loads). Empty/absent when the name is unique. (GH #280)
   duplicated_in?: string[]
+}
+
+/**
+ * Full parsed agent profile from GET /agents/profiles/{name}.
+ * Mirrors AgentProfile.model_dump(exclude_none=True) — the runtime "manifest".
+ */
+export interface AgentProfileDetail {
+  name: string
+  description: string
+  provider?: string
+  system_prompt?: string
+  role?: string
+  skills?: string[]
+  capabilities?: string[]
+  tags?: string[]
+  allowedTools?: string[]
+  mcpServers?: Record<string, unknown>
+  model?: string
+  [key: string]: unknown
 }
 
 export interface AgentDirsSettings {
@@ -192,6 +216,8 @@ export interface GraphExportResult {
 export const api = {
   // Agent Profiles & Providers
   listProfiles: () => fetchJSON<AgentProfileInfo[]>('/agents/profiles'),
+  getProfile: (name: string) =>
+    fetchJSON<AgentProfileDetail>(`/agents/profiles/${encodeURIComponent(name)}`),
   listProviders: () => fetchJSON<ProviderInfo[]>('/agents/providers'),
 
   // Settings

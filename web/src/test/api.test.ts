@@ -36,6 +36,26 @@ describe('API wrapper', () => {
     expect(result).toEqual(profiles)
   })
 
+  it('getProfile fetches /agents/profiles/{name}', async () => {
+    const profile = { name: 'developer', description: 'Dev', system_prompt: 'You build.' }
+    mockResponse(profile)
+    const result = await api.getProfile('developer')
+    expect(result).toEqual(profile)
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/agents/profiles/developer',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+  })
+
+  it('getProfile encodes profile names', async () => {
+    mockResponse({ name: 'a/b', description: '' })
+    await api.getProfile('a/b')
+    expect(mockFetch).toHaveBeenCalledWith(
+      '/agents/profiles/a%2Fb',
+      expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    )
+  })
+
   it('listProviders fetches /agents/providers', async () => {
     const providers = [
       { name: 'kiro_cli', binary: 'kiro-cli', installed: true },
