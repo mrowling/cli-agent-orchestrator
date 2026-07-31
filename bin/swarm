@@ -1,0 +1,477 @@
+#!/usr/bin/env bash
+# Interactive chess-piece launcher for the current working directory (fzf).
+#
+# CAO port of agent-swarm's bin/swarm: pick a piece, launch via `cao launch`
+# with --working-directory=$PWD. Also manages cao-server + Web UI.
+#
+# Usage:
+#   swarm start                # start cao-server in the background
+#   swarm stop                 # stop cao-server (optional: --sessions)
+#   swarm ui                   # open the Web UI in a browser
+#   swarm status               # print server health / pid / urls
+#   swarm                      # fzf pick a piece, launch in $PWD
+#   swarm <piece> [cao args…]  # skip fzf; launch that piece in $PWD
+#   swarm king [slug] […]      # session name king-<slug> (default: basename $PWD)
+#   swarm orchestrator [slug] […]
+#   swarm -h|--help
+#
+# Pieces (must be installed agent profiles — see ensure_profile):
+#   king orchestrator queen bishop rook rook-adversarial knight pawn
+#
+# Env:
+#   CAO_SWARM_ROOT     chess-pieces example root (default: parent of this bin/)
+#   CAO_HOME_DIR       CAO home (default: ~/.aws/cli-agent-orchestrator)
+#   CAO_API_HOST       server bind/connect host (default: 127.0.0.1)
+#   CAO_API_PORT       server port (default: 9889)
+#   SWARM_CONFIRM=1    keep cao launch confirmation prompt (default: --auto-approve)
+#   SWARM_YOLO=1       pass --yolo to cao launch
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# examples/chess-pieces → repo root (used to prefer .venv/bin/cao-server)
+REPO_ROOT="$(cd "$ROOT/../.." && pwd)"
+CAO_SWARM_ROOT="${CAO_SWARM_ROOT:-$ROOT}"
+CAO_HOME="${CAO_HOME_DIR:-$HOME/.aws/cli-agent-orchestrator}"
+AGENT_STORE="${CAO_HOME}/agent-store"
+SWARM_STATE_DIR="${CAO_HOME}/swarm"
+PID_FILE="${SWARM_STATE_DIR}/cao-server.pid"
+LOG_FILE="${SWARM_STATE_DIR}/cao-server.log"
+API_HOST="${CAO_API_HOST:-127.0.0.1}"
+API_PORT="${CAO_API_PORT:-9889}"
+API_BASE="http://${API_HOST}:${API_PORT}"
+
+usage() {
+  cat <<EOF
+Usage: swarm start [--fg]          # start cao-server in background (or --fg)
+       swarm stop [--sessions]     # stop cao-server (also cao shutdown --all)
+       swarm ui                    # open Web UI (\$CAO_API_HOST:\$CAO_API_PORT)
+       swarm status                # health / pid / urls
+       swarm                       # fzf pick a piece, launch in \$PWD
+       swarm <piece> [cao args…]   # skip fzf; launch that piece in \$PWD
+       swarm king [slug] […]       # session king-<slug> for \$PWD (default: basename)
+       swarm orchestrator [slug] […]
+       swarm -h|--help
+
+Server:
+  start                        start cao-server in background; wait for /health
+  stop                         stop the swarm-managed cao-server
+  stop --sessions              also run: cao shutdown --all
+  ui                           open the production Web UI in a browser
+  status                       print whether the server is up
+
+Pieces:
+  king                         supervisor — plan / delegate (never code)
+  orchestrator                 pure decompose-and-delegate supervisor
+  queen                        architecture / major trade-offs
+  bishop                       complex / ambiguous implementation
+  rook                         constructive code review
+  rook-adversarial             high-stakes red-team review
+  knight                       scoped features / bugs
+  pawn                         simple, well-defined tasks
+
+Env:
+  CAO_SWARM_ROOT               chess-pieces example root (default: this example)
+  CAO_HOME_DIR                 CAO home (profiles under \$CAO_HOME_DIR/agent-store)
+  CAO_API_HOST / CAO_API_PORT  server host/port (default: 127.0.0.1:9889)
+  SWARM_CONFIRM=1              keep cao launch confirmation prompt
+  SWARM_YOLO=1                 pass --yolo to cao launch
+EOF
+  exit "${1:-0}"
+}
+
+need_cmd() {
+  if ! command -v "$1" >/dev/null 2>&1; then
+    echo "error: required command not found: $1" >&2
+    exit 1
+  fi
+}
+
+resolve_cao_server() {
+  if [[ -x "${REPO_ROOT}/.venv/bin/cao-server" ]]; then
+    printf '%s' "${REPO_ROOT}/.venv/bin/cao-server"
+    return
+  fi
+  if command -v cao-server >/dev/null 2>&1; then
+    command -v cao-server
+    return
+  fi
+  echo "error: cao-server not found (tried ${REPO_ROOT}/.venv/bin/cao-server and PATH)" >&2
+  exit 1
+}
+
+server_healthy() {
+  curl -fsS --max-time 2 "${API_BASE}/health" >/dev/null 2>&1
+}
+
+pid_alive() {
+  local pid="$1"
+  [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null
+}
+
+read_pidfile() {
+  if [[ -f "$PID_FILE" ]]; then
+    tr -d '[:space:]' <"$PID_FILE"
+  fi
+}
+
+cmd_status() {
+  local pid
+  pid="$(read_pidfile)"
+  if server_healthy; then
+    echo "swarm: cao-server UP at ${API_BASE}"
+  else
+    echo "swarm: cao-server DOWN (${API_BASE})"
+  fi
+  if [[ -n "$pid" ]]; then
+    if pid_alive "$pid"; then
+      echo "swarm: pidfile pid=$pid (alive)  log=$LOG_FILE"
+    else
+      echo "swarm: pidfile pid=$pid (stale)  log=$LOG_FILE"
+    fi
+  else
+    echo "swarm: no pidfile at $PID_FILE"
+  fi
+  echo "swarm: web ui  ${API_BASE}/"
+}
+
+cmd_start() {
+  local foreground=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --fg|--foreground) foreground=1; shift ;;
+      -h|--help) usage 0 ;;
+      *)
+        echo "error: unknown start option: $1" >&2
+        usage 1
+        ;;
+    esac
+  done
+
+  if server_healthy; then
+    echo "swarm: cao-server already running at ${API_BASE}" >&2
+    return 0
+  fi
+
+  local bin
+  bin="$(resolve_cao_server)"
+  mkdir -p "$SWARM_STATE_DIR"
+
+  if [[ "$foreground" -eq 1 ]]; then
+    echo "swarm: starting cao-server (foreground) on ${API_BASE}" >&2
+    echo "swarm: web ui → ${API_BASE}/" >&2
+    exec env CAO_API_HOST="$API_HOST" CAO_API_PORT="$API_PORT" \
+      "$bin" --host "$API_HOST" --port "$API_PORT"
+  fi
+
+  echo "swarm: starting cao-server in background on ${API_BASE}" >&2
+  echo "swarm: log → $LOG_FILE" >&2
+  # shellcheck disable=SC2086
+  nohup env CAO_API_HOST="$API_HOST" CAO_API_PORT="$API_PORT" \
+    "$bin" --host "$API_HOST" --port "$API_PORT" \
+    >"$LOG_FILE" 2>&1 &
+  local pid=$!
+  printf '%s\n' "$pid" >"$PID_FILE"
+
+  local i
+  for i in $(seq 1 60); do
+    if server_healthy; then
+      echo "swarm: cao-server healthy (pid $pid)" >&2
+      echo "swarm: web ui → ${API_BASE}/" >&2
+      return 0
+    fi
+    if ! pid_alive "$pid"; then
+      echo "error: cao-server exited before becoming healthy; log:" >&2
+      tail -n 40 "$LOG_FILE" >&2 || true
+      rm -f "$PID_FILE"
+      exit 1
+    fi
+    sleep 0.25
+  done
+
+  echo "error: cao-server did not become healthy within 15s; log:" >&2
+  tail -n 40 "$LOG_FILE" >&2 || true
+  exit 1
+}
+
+cmd_stop() {
+  local also_sessions=0
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --sessions|--all) also_sessions=1; shift ;;
+      -h|--help) usage 0 ;;
+      *)
+        echo "error: unknown stop option: $1" >&2
+        usage 1
+        ;;
+    esac
+  done
+
+  if [[ "$also_sessions" -eq 1 ]]; then
+    if command -v cao >/dev/null 2>&1 && server_healthy; then
+      echo "swarm: shutting down all cao sessions…" >&2
+      cao shutdown --all >/dev/null 2>&1 || true
+    fi
+  fi
+
+  local pid killed=0
+  pid="$(read_pidfile)"
+  if pid_alive "$pid"; then
+    echo "swarm: stopping cao-server pid=$pid" >&2
+    kill "$pid" 2>/dev/null || true
+    local i
+    for i in $(seq 1 40); do
+      pid_alive "$pid" || break
+      sleep 0.1
+    done
+    if pid_alive "$pid"; then
+      echo "swarm: pid $pid still alive; sending SIGKILL" >&2
+      kill -9 "$pid" 2>/dev/null || true
+    fi
+    killed=1
+  fi
+  rm -f "$PID_FILE"
+
+  # Fallback: anything still listening on the configured port (e.g. started
+  # outside swarm). Prefer lsof; fall back to pkill pattern match.
+  if server_healthy; then
+    local port_pids=""
+    if command -v lsof >/dev/null 2>&1; then
+      port_pids="$(lsof -tiTCP:"$API_PORT" -sTCP:LISTEN 2>/dev/null || true)"
+    fi
+    if [[ -n "$port_pids" ]]; then
+      echo "swarm: stopping listener(s) on :$API_PORT → $port_pids" >&2
+      # shellcheck disable=SC2086
+      kill $port_pids 2>/dev/null || true
+      sleep 0.3
+      if server_healthy; then
+        # shellcheck disable=SC2086
+        kill -9 $port_pids 2>/dev/null || true
+      fi
+      killed=1
+    elif command -v pkill >/dev/null 2>&1; then
+      echo "swarm: stopping cao-server via pkill" >&2
+      pkill -f '[c]ao-server' 2>/dev/null || true
+      killed=1
+    fi
+  fi
+
+  if server_healthy; then
+    echo "error: cao-server still reachable at ${API_BASE}" >&2
+    exit 1
+  fi
+  if [[ "$killed" -eq 1 ]]; then
+    echo "swarm: cao-server stopped" >&2
+  else
+    echo "swarm: cao-server was not running" >&2
+  fi
+}
+
+cmd_ui() {
+  local url="${API_BASE}/"
+  if ! server_healthy; then
+    echo "swarm: cao-server not reachable at ${API_BASE}" >&2
+    echo "swarm: start it with: swarm start" >&2
+    exit 1
+  fi
+  echo "swarm: opening $url" >&2
+  if command -v open >/dev/null 2>&1; then
+    open "$url"
+  elif command -v xdg-open >/dev/null 2>&1; then
+    xdg-open "$url" >/dev/null 2>&1 &
+  elif command -v sensible-browser >/dev/null 2>&1; then
+    sensible-browser "$url" >/dev/null 2>&1 &
+  else
+    echo "error: no browser opener found (open/xdg-open); visit $url" >&2
+    exit 1
+  fi
+}
+
+# Read provider: / model: from profile frontmatter (installed or example md).
+field_for() {
+  local piece="$1" key="$2"
+  local agent_md=""
+  if [[ -f "$AGENT_STORE/${piece}.md" ]]; then
+    agent_md="$AGENT_STORE/${piece}.md"
+  elif [[ -f "$CAO_SWARM_ROOT/${piece}.md" ]]; then
+    agent_md="$CAO_SWARM_ROOT/${piece}.md"
+  else
+    return 0
+  fi
+  awk -v key="$key" '
+    BEGIN { in_fm=0 }
+    /^---[[:space:]]*$/ { in_fm++; next }
+    in_fm==1 && $0 ~ ("^" key ":[[:space:]]*") {
+      sub("^" key ":[[:space:]]*", "")
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "")
+      print
+      exit
+    }
+    in_fm>=2 { exit }
+  ' "$agent_md"
+}
+
+provider_for() {
+  local p
+  p="$(field_for "$1" provider)"
+  printf '%s' "${p:-?}"
+}
+
+model_for() {
+  local piece="$1" model
+  model="$(field_for "$piece" model)"
+  case "$piece" in
+    king|orchestrator) model="${model:-claude (default)}" ;;
+    queen) model="${model:-opus}" ;;
+    *) [[ -z "$model" || "$model" == "inherit" ]] && model="auto" ;;
+  esac
+  printf '%s' "$model"
+}
+
+blurb_for() {
+  case "$1" in
+    king) echo "scoped fleet supervisor for this directory" ;;
+    orchestrator) echo "pure decompose + delegate via assign/handoff" ;;
+    queen) echo "architecture / major trade-offs (Claude)" ;;
+    bishop) echo "complex / ambiguous implementation" ;;
+    rook) echo "constructive code review" ;;
+    rook-adversarial) echo "high-stakes red-team review" ;;
+    knight) echo "scoped features / bugs" ;;
+    pawn) echo "simple, well-defined tasks" ;;
+    *) echo "" ;;
+  esac
+}
+
+PIECES=(king orchestrator queen bishop rook rook-adversarial knight pawn)
+
+menu_lines() {
+  local p provider model blurb
+  for p in "${PIECES[@]}"; do
+    provider="$(provider_for "$p")"
+    model="$(model_for "$p")"
+    blurb="$(blurb_for "$p")"
+    printf '%-18s  %-14s  %-28s  %s\n' "$p" "$provider" "$model" "$blurb"
+  done
+}
+
+pick_piece() {
+  need_cmd fzf
+  local line piece
+  line="$(
+    menu_lines | FZF_DEFAULT_OPTS="${FZF_DEFAULT_OPTS:-}" fzf \
+      --height=40% \
+      --reverse \
+      --border \
+      --prompt='cao piece > ' \
+      --header="Launch in: $PWD" \
+      --preview="piece=\$(echo {} | awk '{print \$1}'); echo \"piece: \$piece\"; echo \"cwd: $PWD\"; echo; if [ -f \"$CAO_SWARM_ROOT/\$piece.md\" ]; then head -40 \"$CAO_SWARM_ROOT/\$piece.md\"; elif [ -f \"$AGENT_STORE/\$piece.md\" ]; then head -40 \"$AGENT_STORE/\$piece.md\"; fi" \
+      --preview-window=right:55%:wrap
+  )" || true
+  [[ -n "$line" ]] || exit 1
+  piece="$(awk '{print $1}' <<<"$line")"
+  printf '%s' "$piece"
+}
+
+ensure_profile() {
+  local piece="$1"
+  local dest="$AGENT_STORE/${piece}.md"
+  local src="$CAO_SWARM_ROOT/${piece}.md"
+  if [[ -f "$dest" ]]; then
+    return 0
+  fi
+  if [[ ! -f "$src" ]]; then
+    echo "error: unknown piece '$piece' (no profile at $src or $dest)" >&2
+    echo "choose: ${PIECES[*]}" >&2
+    exit 1
+  fi
+  need_cmd cao
+  echo "swarm: installing profile '$piece' into agent-store…" >&2
+  cao install "$src"
+}
+
+slug_from_cwd() {
+  local base
+  base="$(basename "$PWD")"
+  # agent-deck / session-name friendly: lowercase, non-alnum → -
+  printf '%s' "$base" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9]+/-/g; s/^-+//; s/-+$//'
+}
+
+is_piece() {
+  local p
+  for p in "${PIECES[@]}"; do
+    [[ "$1" == "$p" ]] && return 0
+  done
+  return 1
+}
+
+launch_piece() {
+  local piece="$1"
+  shift || true
+
+  if ! is_piece "$piece"; then
+    echo "error: unknown piece '$piece'" >&2
+    echo "choose: ${PIECES[*]}" >&2
+    exit 1
+  fi
+
+  ensure_profile "$piece"
+  need_cmd cao
+
+  local -a cmd=(cao launch --agents "$piece" --working-directory "$PWD")
+  if [[ -n "${SWARM_YOLO:-}" ]]; then
+    cmd+=(--yolo)
+  elif [[ -z "${SWARM_CONFIRM:-}" ]]; then
+    cmd+=(--auto-approve)
+  fi
+
+  # king / orchestrator: optional slug → --session-name <piece>-<slug>
+  local slug=""
+  case "$piece" in
+    king|orchestrator)
+      if [[ $# -gt 0 ]] && [[ "$1" != -* ]] && ! [[ "$1" =~ [[:space:]] ]]; then
+        # Treat first non-flag token as slug unless it looks like a sentence
+        # (spaces) — remaining args still go to cao launch as the message.
+        # Heuristic: bare token without spaces and not starting with - is slug
+        # only when the next arg is absent, a flag, or we have exactly one
+        # non-flag arg that is a short identifier.
+        if [[ "$1" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+          slug="$1"
+          shift
+        fi
+      fi
+      slug="${slug:-$(slug_from_cwd)}"
+      cmd+=(--session-name "${piece}-${slug}")
+      ;;
+  esac
+
+  echo "swarm: launching $piece in $PWD" >&2
+  exec "${cmd[@]}" "$@"
+}
+
+PIECE="${1:-}"
+case "$PIECE" in
+  -h|--help) usage 0 ;;
+  start|up)
+    shift || true
+    cmd_start "$@"
+    ;;
+  stop|down)
+    shift || true
+    cmd_stop "$@"
+    ;;
+  ui|web)
+    shift || true
+    cmd_ui "$@"
+    ;;
+  status)
+    shift || true
+    cmd_status "$@"
+    ;;
+  "")
+    PIECE="$(pick_piece)"
+    launch_piece "$PIECE"
+    ;;
+  *)
+    shift || true
+    launch_piece "$PIECE" "$@"
+    ;;
+esac
