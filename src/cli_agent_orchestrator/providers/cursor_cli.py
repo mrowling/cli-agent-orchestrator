@@ -61,6 +61,7 @@ PROCESSING, and a structural "thinking-before-separator" check borrowed
 from the Claude Code provider to avoid stale-spinner false positives.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -68,6 +69,7 @@ import re
 import shlex
 import shutil
 import subprocess
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -601,8 +603,71 @@ class CursorCliProvider(BaseProvider):
         ):
             raise TimeoutError("Cursor CLI initialization timed out after 30 seconds")
 
+        # Status wait fires as soon as the TUI paints IDLE markers, but
+        # Cursor's Ink input box drops keystrokes for a beat after that
+        # — same race Claude Code hit. Gate on a settled input surface
+        # so assign/handoff's first paste is not lost (best effort: a
+        # False return proceeds anyway rather than failing init).
+        await self.wait_until_input_ready()
+
         self._initialized = True
         return True
+
+    def _pane_shows_input_ready(self, pane: str) -> bool:
+        """True when rendered pane content shows an idle Cursor input surface."""
+        clean = strip_terminal_escapes(pane)
+        # v2026+ TUI: placeholder + status bar, and not actively processing.
+        if (
+            re.search(TUI_PLACEHOLDER_PATTERN, clean, re.IGNORECASE)
+            and re.search(TUI_STATUS_BAR_PATTERN, clean)
+            and re.search(TUI_PROCESSING_INDICATOR_PATTERN, clean, re.IGNORECASE) is None
+        ):
+            return True
+        # Older text-mode builds: idle ``❯`` / ``>`` prompt line.
+        if re.search(IDLE_PROMPT_PATTERN, clean, re.MULTILINE):
+            return True
+        return False
+
+    async def wait_until_input_ready(self, timeout: float = 5.0) -> bool:
+        """Settle-check readiness gate for the Cursor Ink input box.
+
+        ``get_status`` reports IDLE as soon as the placeholder / status bar
+        render, but the widget can still drop the first paste while startup
+        content (banner, MCP status, tips) is still painting. Require the
+        rendered pane to be stable across two consecutive captures ~0.5s
+        apart and still show an idle input surface before declaring ready.
+
+        Uses capture-pane (rendered screen) rather than the pipe-pane
+        buffer: stability of the RENDERED output is the readiness signal.
+        Callers treat False as "proceed anyway" — this must never raise
+        for a readiness miss.
+        """
+        poll = 0.5
+        deadline = time.monotonic() + timeout
+        previous: Optional[str] = None
+        while time.monotonic() < deadline:
+            try:
+                current = get_backend().get_history(
+                    self.session_name, self.window_name, tail_lines=40
+                )
+            except Exception as exc:  # backend hiccup: don't fail init for the gate
+                logger.warning("input-ready settle check capture failed: %s", exc)
+                return False
+            if (
+                previous is not None
+                and current == previous
+                and self._pane_shows_input_ready(current)
+            ):
+                logger.debug("input-ready settle check passed for %s", self.terminal_id)
+                return True
+            previous = current
+            await asyncio.sleep(poll)
+        logger.warning(
+            "input-ready settle check timed out after %.1fs for %s; proceeding anyway",
+            timeout,
+            self.terminal_id,
+        )
+        return False
 
     def get_status(self, output: Optional[str]) -> TerminalStatus:
         """Get Cursor CLI status by analyzing terminal output.

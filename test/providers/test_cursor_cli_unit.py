@@ -4,7 +4,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -1068,16 +1068,19 @@ class TestBuildCommandBinaryResolution:
 
 class TestInitialize:
     @pytest.mark.asyncio
+    @patch.object(CursorCliProvider, "wait_until_input_ready", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
-    async def test_initialize_success(self, mock_backend, mock_shell, mock_wait):
+    async def test_initialize_success(self, mock_backend, mock_shell, mock_wait, mock_ready):
         mock_shell.return_value = True
         mock_wait.return_value = True
+        mock_ready.return_value = True
         provider = make_provider()
         assert await provider.initialize() is True
         assert provider._initialized is True
         mock_backend.return_value.send_keys.assert_called_once()
+        mock_ready.assert_awaited_once()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
         # v2026+ rejects --trust in interactive REPL mode. See
         # issue #299. The launch command starts with the resolved
@@ -1108,17 +1111,19 @@ class TestInitialize:
             await provider.initialize()
 
     @pytest.mark.asyncio
+    @patch.object(CursorCliProvider, "wait_until_input_ready", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
     async def test_initialize_does_not_send_system_prompt_flag(
-        self, mock_backend, mock_shell, mock_wait
+        self, mock_backend, mock_shell, mock_wait, mock_ready
     ):
         # v2026.06.15 has a confirmed bug where any request that
         # carries --system-prompt is rejected by the backend, so
         # the provider deliberately omits the flag.
         mock_shell.return_value = True
         mock_wait.return_value = True
+        mock_ready.return_value = True
         provider = make_provider(agent_profile="developer")
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
@@ -1126,22 +1131,29 @@ class TestInitialize:
         assert "--system-prompt" not in sent
 
     @pytest.mark.asyncio
+    @patch.object(CursorCliProvider, "wait_until_input_ready", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
-    async def test_initialize_sends_model_flag(self, mock_backend, mock_shell, mock_wait):
+    async def test_initialize_sends_model_flag(
+        self, mock_backend, mock_shell, mock_wait, mock_ready
+    ):
         mock_shell.return_value = True
         mock_wait.return_value = True
+        mock_ready.return_value = True
         provider = make_provider(model="gpt-5")
         await provider.initialize()
         sent = mock_backend.return_value.send_keys.call_args.args[2]
         assert "--model gpt-5" in sent
 
     @pytest.mark.asyncio
+    @patch.object(CursorCliProvider, "wait_until_input_ready", new_callable=AsyncMock)
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_until_status")
     @patch("cli_agent_orchestrator.providers.cursor_cli.wait_for_shell")
     @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
-    async def test_initialize_arms_stickiness_gate(self, mock_backend, mock_shell, mock_wait):
+    async def test_initialize_arms_stickiness_gate(
+        self, mock_backend, mock_shell, mock_wait, mock_ready
+    ):
         # Copilot review #3411781865: initialize() must call
         # status_monitor.notify_input_sent() before send_keys so
         # the launching command can drive a fresh PROCESSING
@@ -1165,6 +1177,7 @@ class TestInitialize:
 
         mock_shell.return_value = True
         mock_wait.return_value = True
+        mock_ready.return_value = True
         provider = make_provider()
 
         with patch.dict(
@@ -1177,6 +1190,69 @@ class TestInitialize:
         sentinel_status_monitor.notify_input_sent.assert_called_once_with(provider.terminal_id)
         # And send_keys must have been called.
         assert mock_backend.return_value.send_keys.call_count == 1
+
+
+class TestWaitUntilInputReady:
+    """Settle-check gate: 'TUI painted IDLE' is not 'input box accepting paste'.
+
+    Mirrors Claude Code's wait_until_input_ready: require a stable pane that
+    still shows Cursor's idle input surface before the first assign paste.
+    """
+
+    READY_TUI = "Plan, search, build anything\nRun Everything\nComposer 2"
+    LEGACY_IDLE = "❯ "
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_ready_when_pane_stable_with_tui(self, mock_backend):
+        mock_backend.return_value.get_history.side_effect = [self.READY_TUI, self.READY_TUI]
+        provider = make_provider()
+        assert await provider.wait_until_input_ready(timeout=3.0) is True
+        assert mock_backend.return_value.get_history.call_count == 2
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_ready_when_pane_stable_with_legacy_prompt(self, mock_backend):
+        mock_backend.return_value.get_history.side_effect = [self.LEGACY_IDLE, self.LEGACY_IDLE]
+        provider = make_provider()
+        assert await provider.wait_until_input_ready(timeout=3.0) is True
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_waits_out_still_painting_pane(self, mock_backend):
+        mock_backend.return_value.get_history.side_effect = [
+            "Starting Cursor Agent...",
+            "Starting Cursor Agent...\nloading MCP...",
+            self.READY_TUI,
+            self.READY_TUI,
+        ]
+        provider = make_provider()
+        assert await provider.wait_until_input_ready(timeout=5.0) is True
+        assert mock_backend.return_value.get_history.call_count == 4
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_processing_indicator_blocks_ready(self, mock_backend):
+        # Placeholder + status bar alone are not enough while "ctrl+c to stop"
+        # is still on the input-box line (agent working / half-started turn).
+        busy = "Plan, search, build anything  ctrl+c to stop\nRun Everything\nComposer 2"
+        mock_backend.return_value.get_history.return_value = busy
+        provider = make_provider()
+        assert await provider.wait_until_input_ready(timeout=1.2) is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_stable_pane_without_input_surface_does_not_pass(self, mock_backend):
+        mock_backend.return_value.get_history.return_value = "some stable non-prompt content"
+        provider = make_provider()
+        assert await provider.wait_until_input_ready(timeout=1.2) is False
+
+    @pytest.mark.asyncio
+    @patch("cli_agent_orchestrator.providers.cursor_cli.get_backend")
+    async def test_capture_failure_returns_false_not_raise(self, mock_backend):
+        mock_backend.return_value.get_history.side_effect = RuntimeError("pane gone")
+        provider = make_provider()
+        assert await provider.wait_until_input_ready(timeout=2.0) is False
 
 
 # ---------------------------------------------------------------------------
