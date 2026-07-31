@@ -63,6 +63,7 @@ from the Claude Code provider to avoid stale-spinner false positives.
 
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -499,7 +500,7 @@ class CursorCliProvider(BaseProvider):
         # the current terminal for handoff / assign operations. We
         # do not override an explicit preset — the same rule the
         # --mcp <json> path used to follow (issue #300 is the v2026
-        # equivalent).
+        # equivalent). D6: likewise forward CAO_AGENT_DEPTH.
         servers: dict = {}
         for server_name, server_config in mcp_servers.items():
             if isinstance(server_config, dict):
@@ -509,10 +510,12 @@ class CursorCliProvider(BaseProvider):
             # Resolve the bundled cao-mcp-server console script to a
             # PATH-independent invocation.
             servers[server_name] = resolve_mcp_server_config(servers[server_name])
-            env = servers[server_name].get("env", {})
+            env = dict(servers[server_name].get("env") or {})
             if "CAO_TERMINAL_ID" not in env:
                 env["CAO_TERMINAL_ID"] = self.terminal_id
-                servers[server_name]["env"] = env
+            if "CAO_AGENT_DEPTH" not in env:
+                env["CAO_AGENT_DEPTH"] = os.environ.get("CAO_AGENT_DEPTH", "0")
+            servers[server_name]["env"] = env
 
         # Cursor v2026 plugin manifests are JSON files inside the
         # plugin dir. The exact schema is undocumented in the help

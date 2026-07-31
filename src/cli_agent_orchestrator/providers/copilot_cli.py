@@ -185,7 +185,11 @@ class CopilotCliProvider(BaseProvider):
                 "command": mcp_command,
                 "args": mcp_args,
                 "disabled": False,
-                "env": {"CAO_TERMINAL_ID": self.terminal_id},
+                "env": {
+                    "CAO_TERMINAL_ID": self.terminal_id,
+                    # D6: forward spawn depth into MCP subprocess.
+                    "CAO_AGENT_DEPTH": os.environ.get("CAO_AGENT_DEPTH", "0"),
+                },
             }
         }
         return json.dumps({"mcpServers": merged_servers}, ensure_ascii=False)

@@ -19,12 +19,13 @@ Terminal Workflow:
 
 import asyncio
 import logging
+import os
 import re
 import threading
 import time
 from datetime import datetime
 from enum import Enum
-from typing import Dict, Optional
+from typing import Any, Dict, Literal, Optional
 
 from cli_agent_orchestrator.backends.registry import get_backend
 from cli_agent_orchestrator.clients.database import (
@@ -38,6 +39,7 @@ from cli_agent_orchestrator.clients.database import (
     update_terminal_shell_command,
 )
 from cli_agent_orchestrator.constants import (
+    CAO_MAX_ACTIVE_TERMINALS,
     FIFO_DIR,
     PIPE_LIVENESS_TAIL_LINES,
     SESSION_PREFIX,
@@ -146,6 +148,25 @@ SOFT_ENFORCEMENT_PROVIDERS = {
 }
 
 
+class TerminalCapacityError(Exception):
+    """D7: session is at CAO_MAX_ACTIVE_TERMINALS; create_terminal refused.
+
+    Distinguishes capacity rejection from other ValueError paths (e.g. session
+    not found) so the HTTP layer can return a retryable status.
+    """
+
+    def __init__(self, session_name: str, active: int, limit: int) -> None:
+        self.session_name = session_name
+        self.active = active
+        self.limit = limit
+        super().__init__(
+            f"Terminal capacity reached for session '{session_name}': "
+            f"{active}/{limit} active terminals (CAO_MAX_ACTIVE_TERMINALS). "
+            f"Delete unused terminals (delete_terminal) and retry, or raise "
+            f"CAO_MAX_ACTIVE_TERMINALS."
+        )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -200,6 +221,7 @@ async def create_terminal(
 
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
+        TerminalCapacityError: If the session is already at CAO_MAX_ACTIVE_TERMINALS (D7)
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
@@ -220,12 +242,29 @@ async def create_terminal(
 
         window_name = generate_window_name(agent_profile)
 
+        # Ensure session name has the CAO prefix early so the D7 capacity check
+        # and tmux lookups share the same key as create_session/create_window.
+        if new_session and not session_name.startswith(SESSION_PREFIX):
+            session_name = f"{SESSION_PREFIX}{session_name}"
+
+        # D7: per-session admission control before any tmux/DB work.
+        # "Active" = DB-tracked terminal rows for this session (not live tmux).
+        if not new_session:
+            from cli_agent_orchestrator.clients.database import list_terminals_by_session
+
+            active = len(list_terminals_by_session(session_name))
+            if active >= CAO_MAX_ACTIVE_TERMINALS:
+                raise TerminalCapacityError(session_name, active, CAO_MAX_ACTIVE_TERMINALS)
+
+        # D6: every spawned window carries CAO_AGENT_DEPTH (absent ⇒ treat as 0
+        # for operator-launched roots; assign/handoff pass parent+1 via env_vars).
+        merged_env: dict[str, str] = dict(env_vars or {})
+        if "CAO_AGENT_DEPTH" not in merged_env:
+            merged_env["CAO_AGENT_DEPTH"] = "0"
+        env_vars = merged_env
+
         # Step 2: Create tmux session or window
         if new_session:
-            # Ensure session name has the CAO prefix for identification
-            if not session_name.startswith(SESSION_PREFIX):
-                session_name = f"{SESSION_PREFIX}{session_name}"
-
             # Prevent duplicate sessions
             if get_backend().session_exists(session_name):
                 raise ValueError(f"Session '{session_name}' already exists")
@@ -1250,6 +1289,71 @@ def get_output(terminal_id: str, mode: OutputMode = OutputMode.FULL) -> str:
     except Exception as e:
         logger.error(f"Failed to get output from terminal {terminal_id}: {e}")
         raise
+
+
+def read_terminal_transcript(
+    terminal_id: str,
+    max_chars: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Read an on-disk terminal transcript (D16).
+
+    Prefers ``TERMINAL_LOG_DIR/{id}.log`` (LogWriter pipe-pane history); falls
+    back to ``TERMINAL_LOG_DIR/{id}.scrollback`` (delete-time snapshot).
+
+    **Forbidden sources (D16):** ``OutputMode.FULL``, StatusMonitor rolling
+    buffer, and live tmux capture — those are not transcripts. Path is resolved
+    solely from ``terminal_id`` under ``TERMINAL_LOG_DIR`` (fail closed); there
+    is no path parameter.
+
+    ``max_chars`` uses ops_mcp tail semantics: when set and positive and the
+    full text exceeds the cap, return ``output[-max_chars:]`` with
+    ``truncated=True``. ``total_chars`` is always the pre-cap length.
+    """
+    from cli_agent_orchestrator.utils.path_validation import safe_join_under_base
+
+    base = str(TERMINAL_LOG_DIR)
+    try:
+        log_path = safe_join_under_base(base, f"{terminal_id}.log")
+        scrollback_path = safe_join_under_base(base, f"{terminal_id}.scrollback")
+    except ValueError as e:
+        raise ValueError(f"Invalid terminal_id for transcript resolve: {e}") from e
+
+    source: Literal["log", "scrollback"]
+    chosen: str
+    # Prefer live log; scrollback is the delete-time fallback only.
+    if os.path.isfile(log_path):
+        chosen = log_path
+        source = "log"
+    elif os.path.isfile(scrollback_path):
+        chosen = scrollback_path
+        source = "scrollback"
+    else:
+        raise ValueError(f"No transcript found for terminal '{terminal_id}'")
+
+    # Re-check containment after existence (symlink race / rename).
+    try:
+        chosen_real = safe_join_under_base(base, os.path.basename(chosen))
+    except ValueError as e:
+        raise ValueError(f"Transcript path escapes TERMINAL_LOG_DIR: {e}") from e
+    if os.path.realpath(chosen) != os.path.realpath(chosen_real):
+        raise ValueError("Transcript path escapes TERMINAL_LOG_DIR")
+
+    with open(chosen, "r", encoding="utf-8", errors="replace") as fh:
+        output = fh.read()
+
+    total_chars = len(output)
+    truncated = False
+    if max_chars is not None and max_chars > 0 and total_chars > max_chars:
+        output = output[-max_chars:]
+        truncated = True
+
+    return {
+        "output": output,
+        "truncated": truncated,
+        "total_chars": total_chars,
+        "terminal_id": terminal_id,
+        "source": source,
+    }
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:

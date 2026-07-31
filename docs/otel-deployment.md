@@ -134,6 +134,35 @@ Then check the backend for:
 - the `cao.orchestration.dispatches` counter (tagged with
   `cao.orchestration.type`) incrementing per dispatch.
 
+### Swarm-health metrics (D3)
+
+When telemetry is enabled, CAO also emits the following instruments from
+[`telemetry/metrics.py`](../src/cli_agent_orchestrator/telemetry/metrics.py).
+Each follows the same lazy no-op pattern as the dispatch counter — inert unless
+the `[otel]` extra is installed and `OTEL_SDK_DISABLED=false`.
+
+| Instrument | Type | Attributes | Purpose |
+| --- | --- | --- | --- |
+| `cao.agent.step.duration` | histogram (ms) | `cao.provider`, `cao.agent.profile`, `cao.model`, `cao.role`, `cao.outcome` | Wall-clock per agent step. **`cao.model` and `cao.role` are mandatory** on every record — T2 cost slicing depends on them. |
+| `cao.agent.terminals.active` | up-down counter | `cao.session`, `cao.provider` | Concurrent active terminals. Use `adjust_active_terminals(+1/-1, ...)` at create/teardown. |
+| `cao.agent.spawn.depth` | histogram | `cao.orchestration.type` | Spawn depth at dispatch time (wired when D6 depth limiting lands). |
+| `cao.agent.step.attempts` | histogram | `cao.agent.profile` | Retry count per step (bounded by workflow max attempts). |
+| `cao.review.rejections` | counter | `cao.reviewer.profile`, `cao.reviewer.model`, `cao.lens` | Review-cycle rejections by decorrelated lens. |
+| `cao.repo.collisions` | counter | `cao.collision.kind` (minimal set until D5) | Repo collision events; detection wired in D5. |
+
+Record helpers (all no-op without `[otel]`):
+
+- `record_agent_step_duration(duration_ms, *, provider, agent_profile, model, role, outcome)`
+- `adjust_active_terminals(delta, *, session, provider)`
+- `record_spawn_depth(depth, *, orchestration_type)`
+- `record_step_attempts(attempts, *, agent_profile)`
+- `record_review_rejection(*, reviewer_profile, reviewer_model, lens)`
+- `record_repo_collision(*, kind)`
+
+**Wired today:** blocking `handoff` records `cao.agent.step.duration` on every
+outcome (success, failure, timeout). Other helpers are callable and tested;
+full call-site wiring lands with knight-owned workflow/terminal paths (D1, D6).
+
 The active trace context is also injected into the outgoing plugin event as a
 W3C `traceparent`, so a downstream consumer can continue the same trace.
 

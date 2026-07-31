@@ -76,7 +76,19 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
   not unbounded scrollback. Long sessions are truncated to the tail; use the
-  on-disk terminal log for complete history.
+  on-disk terminal log or transcript route for complete history. When auth is
+  enabled, this route requires `cao:read` (or write/admin) — same floor as
+  other read surfaces (D16).
+- `GET /terminals/{terminal_id}/transcript?max_chars=` returns the on-disk
+  transcript: prefers `TERMINAL_LOG_DIR/{id}.log`, else `{id}.scrollback`.
+  Optional `max_chars` is a tail cap (ops_mcp semantics). Response includes
+  `output`, `truncated`, `total_chars`, `terminal_id`, and `source`
+  (`log`|`scrollback`). Never uses the rolling buffer or live tmux capture.
+  **Not a public dump:** requires header `X-CAO-Caller-Terminal-Id` (caller's
+  8-hex TerminalId, not the target) whose `agent_profile` declares
+  `get_terminal_transcript` — fail-closed even when auth is off (D16; King
+  arbitration vs auth-off bypass). Also requires `cao:read` (or write/admin)
+  when auth is enabled.
 
 Terminal identifiers used in these routes are eight-character hexadecimal
 strings. See [Control Planes](control-planes.md) for operator-facing choices.

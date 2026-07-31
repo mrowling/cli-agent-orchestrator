@@ -22,9 +22,9 @@ def _auth_headers() -> Dict[str, str]:
 
     Mirrors ``app_tools._auth_headers``: attaches the operator-provisioned
     ``CAO_AUTH_LOCAL_TOKEN`` when the auth layer is enabled, and returns an empty
-    mapping default-off so the no-auth posture is byte-for-byte unchanged. Reads
-    are not scope-gated today, but the header is attached for consistency so the
-    whole MCP->API hop behaves the same with auth on.
+    mapping default-off so the no-auth posture is byte-for-byte unchanged.
+    Required when auth is on for scope-gated reads such as
+    ``GET /terminals/{id}/transcript`` and ``GET /terminals/{id}/output`` (D16).
     """
 
     token = get_local_bearer()

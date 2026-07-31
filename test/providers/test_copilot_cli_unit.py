@@ -546,6 +546,8 @@ class TestCopilotCliProviderMisc:
         runtime_cfg = json.loads(provider._build_runtime_mcp_config())
         assert "cao-mcp-server" in runtime_cfg["mcpServers"]
         assert runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "abc12345"
+        # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
+        assert runtime_cfg["mcpServers"]["cao-mcp-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
 
     def test_build_runtime_mcp_config_resolves_bundled_command(self):
         """The bundled cao-mcp-server is resolved to a PATH-independent

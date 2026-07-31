@@ -60,6 +60,7 @@ from cli_agent_orchestrator.services.workflow_service import (
     StepRunState,
     _active_drives,
     _is_resumable_for_tier,
+    _step_result,
     run_registry,
 )
 
@@ -402,8 +403,49 @@ def make_step_terminal_recorder(
 
         st = record.step_states.get(step_id)
         if st is None:
-            st = StepRunState(step_id=step_id, state=StepState.RUNNING)
+            # D1: stamp started_at at RUNNING transition (journaled below).
+            now = _now()
+            st = StepRunState(step_id=step_id, state=StepState.RUNNING, started_at=now)
             record.step_states[step_id] = st
+            try:
+                workflow_journal.append_step(
+                    run_id,
+                    step_id,
+                    StepState.RUNNING.value,
+                    now,
+                    "",
+                    started_at=now,
+                )
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — best-effort; in-memory floor still serves live reads
+                logger.debug(
+                    "journal: script step '%s/%s' RUNNING write failed: %s",
+                    run_id,
+                    step_id,
+                    exc,
+                )
+        elif st.state == StepState.RUNNING and st.started_at is None:
+            now = _now()
+            st.started_at = now
+            try:
+                workflow_journal.update_step(
+                    run_id=run_id,
+                    step_id=step_id,
+                    state=st.state.value,
+                    attempts=st.attempts,
+                    updated_at=now,
+                    started_at=now,
+                )
+            except (
+                Exception
+            ) as exc:  # noqa: BLE001 — best-effort; in-memory floor still serves live reads
+                logger.debug(
+                    "journal: script step '%s/%s' started_at write failed: %s",
+                    run_id,
+                    step_id,
+                    exc,
+                )
         st.terminal_id = terminal_id
 
     return _record
@@ -470,15 +512,19 @@ def record_step_completion(
     fingerprint = _step_call_fingerprint(provider, agent, prompt)
 
     def _settle(terminal_id: Optional[str], error: Optional[str]) -> None:
+        now = _now()
         st = record.step_states.get(step_id)
         if st is None:
             # No prior RUNNING seed (e.g. the terminal-created callback never
             # fired) — create the state so the transition is still recorded.
-            st = StepRunState(step_id=step_id, state=StepState.RUNNING)
+            st = StepRunState(step_id=step_id, state=StepState.RUNNING, started_at=now)
             record.step_states[step_id] = st
+        if st.started_at is None:
+            st.started_at = now
         if terminal_id is not None:
             st.terminal_id = terminal_id
         st.attempts += 1
+        st.updated_at = now
 
         if error is not None:
             st.state = StepState.FAILED
@@ -503,10 +549,16 @@ def record_step_completion(
         # writer, VR-4 — excluded from DO UPDATE so it is fixed at first arrival);
         # (2) update_step fills attempts/output_json/error, which append_step
         # hardcodes to 0/NULL/NULL. Never raises into the step (INV-4).
-        now = _now()
         output_json = json.dumps(st.output.output) if st.output is not None else None
         try:
-            workflow_journal.append_step(run_id, step_id, st.state.value, now, fingerprint)
+            workflow_journal.append_step(
+                run_id,
+                step_id,
+                st.state.value,
+                now,
+                fingerprint,
+                started_at=st.started_at,
+            )
             workflow_journal.update_step(
                 run_id=run_id,
                 step_id=step_id,
@@ -515,6 +567,7 @@ def record_step_completion(
                 updated_at=now,
                 output_json=output_json,
                 error=st.error,
+                started_at=st.started_at,  # D1: backfill NULL journal rows via COALESCE
             )
         except (
             Exception
@@ -606,18 +659,7 @@ def _journal_run_state(record: ScriptRunRecord) -> None:
 
 def _build_steps(record: ScriptRunRecord) -> List[StepResult]:
     """Aggregate the record's per-step states into the result's step list."""
-    steps: List[StepResult] = []
-    for step_id, st in record.step_states.items():
-        steps.append(
-            StepResult(
-                id=step_id,
-                state=st.state,
-                attempts=st.attempts,
-                output=st.output.output if st.output is not None else None,
-                error=st.error,
-            )
-        )
-    return steps
+    return [_step_result(step_id, st) for step_id, st in record.step_states.items()]
 
 
 async def _finalize(

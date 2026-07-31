@@ -512,6 +512,10 @@ ROLE_TOOL_DEFAULTS = {
     "supervisor": ["@cao-mcp-server", "fs_read", "fs_list"],
     "reviewer": ["@builtin", "fs_read", "fs_list", "@cao-mcp-server"],
     "developer": ["@builtin", "fs_*", "execute_bash", "web_fetch", "@cao-mcp-server"],
+    # D9: workflow_scout was a live unknown role that silently resolved to ["*"].
+    # Tool set matches agent_store/workflow_scout.md frontmatter intent (read-oriented
+    # plus execute_bash for `cao workflow list` / `cao workflow get`).
+    "workflow_scout": ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"],
 }
 
 # Security constraints prepended to system prompts for providers without
@@ -621,11 +625,30 @@ SCRIPT_LINT_NONDETERMINISM_MODULES = frozenset({"random", "secrets", "uuid", "ti
 
 # Env-var injection allowlist for POST /terminals/run-step (Bolt 2, U2/C6,
 # NFR-SEC-4 BINDING). Deny-by-default: the injection surface into a tmux
-# terminal environment is exactly these three documented identity keys.
+# terminal environment is exactly these documented identity keys.
 # Extending it is a constants.py + gate decision, never a route-local edit.
+# D6: CAO_AGENT_DEPTH joins the allowlist so spawn-depth can be injected on
+# the handoff/run-step path the same way workflow identity keys are.
 WORKFLOW_ENV_ALLOWLIST = frozenset(
-    {"CAO_WORKFLOW_RUN_ID", "CAO_WORKFLOW_STEP_ID", "CAO_WORKFLOW_GENERATION"}
+    {
+        "CAO_WORKFLOW_RUN_ID",
+        "CAO_WORKFLOW_STEP_ID",
+        "CAO_WORKFLOW_GENERATION",
+        "CAO_AGENT_DEPTH",
+    }
 )
+
+# D6: max spawn depth for assign/handoff. Absent CAO_AGENT_DEPTH on the parent
+# means depth 0; the child would be 1. Reject when the child depth would
+# *reach* this cap (``>=``). Default 3 ⇒ supervisor(0)→planner(1)→worker(2);
+# spawning a child at depth 3 is rejected.
+CAO_MAX_AGENT_DEPTH = _env_int("CAO_MAX_AGENT_DEPTH", 3)
+
+# D7: hard admission control on create_terminal (per session). Soft nudge at
+# TERMINAL_CLEANUP_NUDGE_THRESHOLD (mcp_server) stays advisory; this cap stops
+# the machine falling over. Default 12 sits above the nudge (10).
+# "Active" = DB-tracked terminal rows for the session (list_terminals_by_session).
+CAO_MAX_ACTIVE_TERMINALS = _env_int("CAO_MAX_ACTIVE_TERMINALS", 12)
 
 # Pre-regex length cap on run-step env-var VALUES (U2-BR-2). Defense-in-depth,
 # not redundancy: bounds the input O(1) before any regex evaluation and bounds

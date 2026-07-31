@@ -119,7 +119,7 @@ Override via REST API, Web UI Settings page, `cao config set agents.dirs.<provid
 
 `agents.disabled_dirs` lists configured directories (defaults or extras) the user has toggled **off**: a disabled directory stays listed in Settings but is skipped when scanning for and loading agent profiles, so its profiles leave the active set without removing the path (GH #280/#281). Only paths that match a configured directory are accepted; entries are validated with the same path normalization the scanner uses (`~`, trailing slashes, and symlinks all match). Manage it via the Web UI Settings toggles, `cao config set agents.disabled_dirs '[...]'`, or `settings.json`.
 
-`agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` roles.
+`agents.roles` defines custom [role](../CODEBASE.md) → `allowedTools` bundles, layered on top of the built-in `supervisor` / `reviewer` / `developer` / `workflow_scout` roles. Unknown roles fail closed at tool resolution (see [tool-restrictions.md](tool-restrictions.md)). Write via `cao config set agents.roles.<name> '[...]'`, the REST/settings surfaces, or `settings_service.set_agent_roles`.
 
 ### Skills (`skills`)
 
@@ -261,6 +261,9 @@ A number of other `CAO_*` variables (runtime/process-identity vars like `CAO_TER
 | Env var | Default | Type | Purpose |
 |---|---|---|---|
 | `CAO_HOME_DIR` | `~/.aws/cli-agent-orchestrator` | str (path) | Base directory for all CAO state. See [Data directory](#data-directory-cao_home_dir) above. |
+| `CAO_MAX_AGENT_DEPTH` | `3` | int | D6: max spawn depth for `assign`/`handoff` (absent `CAO_AGENT_DEPTH` ⇒ parent depth 0). Rejects with an actionable error when the child depth would **reach** the cap (`>=`; default 3 ⇒ supervisor(0)→planner(1)→worker(2); spawning at depth 3 is rejected). |
+| `CAO_MAX_ACTIVE_TERMINALS` | `12` | int | D7: per-session admission control in `create_terminal` (active = DB-tracked terminal rows). At/over the cap returns HTTP 429 with a retry hint. Soft cleanup nudge at 10 terminals remains advisory. |
+| `CAO_AGENT_DEPTH` | (unset ⇒ `0`) | int | Runtime identity injected into each spawned window; incremented from the parent on assign/handoff. Allowlisted on `POST /terminals/run-step`. |
 
 The pipe-pane liveness watchdog (issue #388, `services/fifo_reader.py`) adds six more of these ad-hoc vars, read directly via `_env_int`/`_env_float` in `constants.py` rather than through `ConfigService` — they have no `settings.json` mapping like the rows in the table above:
 

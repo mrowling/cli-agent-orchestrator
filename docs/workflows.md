@@ -210,6 +210,17 @@ end-to-end.
   interactive prompt from a workflow step (a fix is planned); until it lands, use a
   headless provider.
 
+## Step timing (journal)
+
+Each step row in the durable ``workflow_run_step`` journal carries:
+
+| Column | Meaning |
+| --- | --- |
+| ``started_at`` | ISO-8601 timestamp set once when the step enters ``running``. Journaled so wall-clock duration survives resume. Pre-D1 rows and steps never observed running leave this ``NULL``. |
+| ``updated_at`` | ISO-8601 timestamp of the last journal mutation. On terminal step states this maps to ``finished_at`` in the run result — there is no separate ``finished_at`` column. |
+
+A completed ``WorkflowRunResult`` exposes per-step ``started_at``, ``finished_at``, and ``duration_ms`` (milliseconds between the two when both are present, else ``null``). The run envelope also includes a computed ``duration_ms`` from its own ``started_at``/``finished_at``.
+
 ## Resume
 
 `cao workflow resume <run-id>` re-drives an interrupted run: it replays already-completed

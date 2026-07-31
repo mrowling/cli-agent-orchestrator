@@ -20,7 +20,15 @@ from typing import Any, Iterator, Optional
 
 try:
     from cli_agent_orchestrator.telemetry.context import extract_traceparent, inject_traceparent
-    from cli_agent_orchestrator.telemetry.metrics import record_orchestration_dispatch
+    from cli_agent_orchestrator.telemetry.metrics import (
+        adjust_active_terminals,
+        record_agent_step_duration,
+        record_orchestration_dispatch,
+        record_repo_collision,
+        record_review_rejection,
+        record_spawn_depth,
+        record_step_attempts,
+    )
     from cli_agent_orchestrator.telemetry.otel import init_telemetry, shutdown_telemetry
     from cli_agent_orchestrator.telemetry.spans import (
         chat_span,
@@ -58,6 +66,37 @@ except ImportError as exc:  # opentelemetry not installed (base install, no [ote
     def record_orchestration_dispatch(orchestration_type: str) -> None:
         """No-op: no metric instruments without the [otel] extra."""
 
+    def record_agent_step_duration(
+        duration_ms: int,
+        *,
+        provider: str,
+        agent_profile: str,
+        model: str,
+        role: str,
+        outcome: str,
+    ) -> None:
+        """No-op: no metric instruments without the [otel] extra."""
+
+    def adjust_active_terminals(delta: int, *, session: str, provider: str) -> None:
+        """No-op: no metric instruments without the [otel] extra."""
+
+    def record_spawn_depth(depth: int, *, orchestration_type: str) -> None:
+        """No-op: no metric instruments without the [otel] extra."""
+
+    def record_step_attempts(attempts: int, *, agent_profile: str) -> None:
+        """No-op: no metric instruments without the [otel] extra."""
+
+    def record_review_rejection(
+        *,
+        reviewer_profile: str,
+        reviewer_model: str,
+        lens: str,
+    ) -> None:
+        """No-op: no metric instruments without the [otel] extra."""
+
+    def record_repo_collision(*, kind: str) -> None:
+        """No-op: no metric instruments without the [otel] extra."""
+
     def inject_traceparent() -> Optional[str]:
         """No-op: no recording span can exist without the [otel] extra."""
         return None
@@ -93,12 +132,18 @@ except ImportError as exc:  # opentelemetry not installed (base install, no [ote
 
 __all__ = [
     "OTEL_AVAILABLE",
+    "adjust_active_terminals",
     "chat_span",
     "execute_tool_span",
     "extract_traceparent",
     "init_telemetry",
     "invoke_agent_span",
     "inject_traceparent",
+    "record_agent_step_duration",
     "record_orchestration_dispatch",
+    "record_repo_collision",
+    "record_review_rejection",
+    "record_spawn_depth",
+    "record_step_attempts",
     "shutdown_telemetry",
 ]

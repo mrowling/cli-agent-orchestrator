@@ -427,3 +427,41 @@ class TestGetServerSettings:
         monkeypatch.setenv("CAO_STATE_BUFFER_MAX", "0")
         result = get_server_settings()
         assert result["state_buffer_max"] == 32768
+
+
+class TestAgentRoles:
+    """D9: agents.roles getter/setter."""
+
+    def test_get_empty_when_unset(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import get_agent_roles
+
+        assert get_agent_roles() == {}
+
+    def test_set_and_get_round_trip(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import (
+            get_agent_roles,
+            set_agent_roles,
+        )
+
+        result = set_agent_roles({"data_analyst": ["fs_read", "execute_bash"]})
+        assert result == {"data_analyst": ["fs_read", "execute_bash"]}
+        assert get_agent_roles() == {"data_analyst": ["fs_read", "execute_bash"]}
+        data = json.loads(settings_file.read_text())
+        assert data["agents"]["roles"]["data_analyst"] == ["fs_read", "execute_bash"]
+        assert data["roles"]["data_analyst"] == ["fs_read", "execute_bash"]
+
+    def test_set_rejects_non_list_tools(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import set_agent_roles
+
+        with pytest.raises(ValueError, match="list of allowedTools"):
+            set_agent_roles({"bad": "not-a-list"})  # type: ignore[arg-type]
+
+    def test_set_empty_clears(self, settings_file):
+        from cli_agent_orchestrator.services.settings_service import (
+            get_agent_roles,
+            set_agent_roles,
+        )
+
+        set_agent_roles({"tmp": ["fs_read"]})
+        set_agent_roles({})
+        assert get_agent_roles() == {}

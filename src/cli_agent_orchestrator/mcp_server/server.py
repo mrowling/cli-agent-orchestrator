@@ -12,6 +12,7 @@ from pydantic import Field
 
 from cli_agent_orchestrator.constants import (
     API_BASE_URL,
+    CAO_MAX_AGENT_DEPTH,
     DEFAULT_PROVIDER,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
@@ -27,7 +28,7 @@ from cli_agent_orchestrator.services.memory_service import (
 from cli_agent_orchestrator.services.outcome_service import LEARNING_DISABLED_MESSAGE
 from cli_agent_orchestrator.services.profile_search import DEFAULT_LIMIT
 from cli_agent_orchestrator.services.settings_service import get_server_settings
-from cli_agent_orchestrator.utils.agent_profiles import resolve_provider
+from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.terminal import generate_session_name
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,38 @@ ENABLE_SENDER_ID_INJECTION = os.getenv("CAO_ENABLE_SENDER_ID_INJECTION", "true")
 TERMINAL_CLEANUP_NUDGE_THRESHOLD = 10
 MAX_USER_PROMPT_ANSWER_LENGTH = 4000
 _TERMINAL_ID_PATTERN = re.compile(r"^[a-f0-9]{8}$")
+
+# D6: actionable rejection when assign/handoff would reach CAO_MAX_AGENT_DEPTH
+_DEPTH_LIMIT_MESSAGE = (
+    "Spawn depth limit reached (CAO_MAX_AGENT_DEPTH={max_depth}): "
+    "child depth would be {child_depth}. Do the work yourself or return "
+    "to your caller — do not retry assign/handoff at this depth. "
+    "Raise CAO_MAX_AGENT_DEPTH only if a deeper tree is intentional."
+)
+
+
+def _parent_agent_depth() -> int:
+    """Read CAO_AGENT_DEPTH from this MCP process (absent ⇒ 0). D6."""
+    raw = os.environ.get("CAO_AGENT_DEPTH", "0")
+    try:
+        depth = int(raw)
+    except ValueError:
+        depth = 0
+    return max(0, depth)
+
+
+def _child_agent_depth_or_reject() -> Union[int, str]:
+    """Return child depth, or an error message if the spawn would reach the cap.
+
+    D6: reject when child depth would reach CAO_MAX_AGENT_DEPTH (``>=``) — never
+    a silent no-op (an agent that believes it delegated is worse than a clear
+    error). Default 3 ⇒ supervisor(0)→planner(1)→worker(2); spawning a child
+    at depth 3 is rejected.
+    """
+    child_depth = _parent_agent_depth() + 1
+    if child_depth >= CAO_MAX_AGENT_DEPTH:
+        return _DEPTH_LIMIT_MESSAGE.format(max_depth=CAO_MAX_AGENT_DEPTH, child_depth=child_depth)
+    return child_depth
 
 
 def _current_terminal_id() -> Optional[str]:
@@ -175,6 +208,7 @@ def _create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
+    env_vars: Optional[Dict[str, str]] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -198,6 +232,8 @@ def _create_terminal(
             ahead of the agent profile's own static model field (where the
             resolved provider supports it). Honored by both the existing-
             session and new-session branches.
+        env_vars: Optional env map forwarded into the new window (D6:
+            ``CAO_AGENT_DEPTH`` for spawn-depth tracking).
 
     Returns:
         Tuple of (terminal_id, provider)
@@ -260,18 +296,21 @@ def _create_terminal(
         # The message payload goes in the JSON body, not the query string, so
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
-        json_body = None
-        if defer_init:
-            params["defer_init"] = "true"
+        json_body: Optional[Dict[str, Any]] = None
+        if defer_init or env_vars:
             json_body = {}
-            if initial_message is not None:
-                json_body["initial_message"] = initial_message
-            if initial_message_orchestration_type is not None:
-                json_body["initial_message_orchestration_type"] = (
-                    initial_message_orchestration_type.value
-                    if isinstance(initial_message_orchestration_type, OrchestrationType)
-                    else str(initial_message_orchestration_type)
-                )
+            if defer_init:
+                params["defer_init"] = "true"
+                if initial_message is not None:
+                    json_body["initial_message"] = initial_message
+                if initial_message_orchestration_type is not None:
+                    json_body["initial_message_orchestration_type"] = (
+                        initial_message_orchestration_type.value
+                        if isinstance(initial_message_orchestration_type, OrchestrationType)
+                        else str(initial_message_orchestration_type)
+                    )
+            if env_vars:
+                json_body["env_vars"] = env_vars
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -305,14 +344,18 @@ def _create_terminal(
             params["model"] = model
 
         json_body = None
-        if initial_message is not None:
-            json_body = {"initial_message": initial_message}
+        if initial_message is not None or env_vars:
+            json_body = {}
+            if initial_message is not None:
+                json_body["initial_message"] = initial_message
             if initial_message_orchestration_type is not None:
                 json_body["initial_message_orchestration_type"] = (
                     initial_message_orchestration_type.value
                     if isinstance(initial_message_orchestration_type, OrchestrationType)
                     else str(initial_message_orchestration_type)
                 )
+            if env_vars:
+                json_body["env_vars"] = env_vars
 
         response = requests.post(
             f"{API_BASE_URL}/sessions",
@@ -693,6 +736,43 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 
 
 # Implementation functions
+def _handoff_duration_ms(start_time: float) -> int:
+    """D2: wall-clock duration of a blocking handoff in milliseconds."""
+
+    return int((time.time() - start_time) * 1000)
+
+
+def _record_handoff_step_duration(
+    duration_ms: int,
+    *,
+    provider: str,
+    agent_profile: str,
+    model: Optional[str],
+    outcome: str,
+) -> None:
+    """D3: record cao.agent.step.duration for a blocking handoff."""
+
+    from cli_agent_orchestrator.telemetry import record_agent_step_duration
+
+    role = "unknown"
+    resolved_model = model or "unknown"
+    try:
+        profile = load_agent_profile(agent_profile)
+        role = profile.role or "developer"
+        if not model and profile.model:
+            resolved_model = profile.model
+    except Exception:
+        pass
+    record_agent_step_duration(
+        duration_ms,
+        provider=provider,
+        agent_profile=agent_profile,
+        model=resolved_model,
+        role=role,
+        outcome=outcome,
+    )
+
+
 async def _handoff_impl(
     agent_profile: str,
     message: str,
@@ -720,8 +800,22 @@ async def _handoff_impl(
     """
     start_time = time.time()
     terminal_id: Optional[str] = None
+    provider = "unknown"
 
     try:
+        # D6: reject before any create when child depth would reach the cap.
+        child_depth_or_err = _child_agent_depth_or_reject()
+        if isinstance(child_depth_or_err, str):
+            duration_ms = _handoff_duration_ms(start_time)
+            return HandoffResult(
+                success=False,
+                message=f"Handoff failed: {child_depth_or_err}",
+                output=None,
+                terminal_id=None,
+                duration_ms=duration_ms,
+            )
+        child_depth = child_depth_or_err
+
         # Resolve the supervisor context WITHOUT creating a terminal, so the
         # codex fast-fail (which needs CAO_TERMINAL_ID) and the codex
         # prompt-shaping can both run caller-side before the single combined
@@ -736,6 +830,14 @@ async def _handoff_impl(
         # Fail fast for codex: its handoff banner requires CAO_TERMINAL_ID. We
         # check before any terminal is created (no terminal_id to surface yet).
         if provider == "codex" and not _current_terminal_id():
+            duration_ms = _handoff_duration_ms(start_time)
+            _record_handoff_step_duration(
+                duration_ms,
+                provider=provider,
+                agent_profile=agent_profile,
+                model=model,
+                outcome="failure",
+            )
             return HandoffResult(
                 success=False,
                 message=(
@@ -745,6 +847,7 @@ async def _handoff_impl(
                 ),
                 output=None,
                 terminal_id=None,
+                duration_ms=duration_ms,
             )
 
         # Shape the prompt caller-side (prepends the codex [CAO Handoff] banner
@@ -755,12 +858,14 @@ async def _handoff_impl(
         # extract -> teardown, all server-side via run_agent_step. session_name
         # places the worker in the supervisor's session; caller_id/allowed_tools
         # preserve #284 callback routing and tool inheritance.
+        # D6: inject CAO_AGENT_DEPTH (allowlisted) so the child MCP reads it.
         payload: Dict[str, Any] = {
             "provider": provider,
             "agent": agent_profile,
             "prompt": shaped_message,
             "teardown": True,
             "timeout": float(timeout),
+            "env_vars": {"CAO_AGENT_DEPTH": str(child_depth)},
         }
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
@@ -773,6 +878,13 @@ async def _handoff_impl(
         if model:
             payload["model"] = model
 
+        try:
+            from cli_agent_orchestrator.telemetry import record_spawn_depth
+
+            record_spawn_depth(child_depth, orchestration_type="handoff")
+        except Exception:
+            pass
+
         # Allow the full step time plus the server-side ready-wait (up to 120s)
         # plus headroom; the server enforces the per-step timeout internally.
         client_timeout = float(timeout) + 180.0
@@ -783,11 +895,20 @@ async def _handoff_impl(
                 timeout=client_timeout,
             )
         except requests.Timeout:
+            duration_ms = _handoff_duration_ms(start_time)
+            _record_handoff_step_duration(
+                duration_ms,
+                provider=provider,
+                agent_profile=agent_profile,
+                model=model,
+                outcome="timeout",
+            )
             return HandoffResult(
                 success=False,
                 message=f"Handoff timed out after {timeout} seconds",
                 output=None,
                 terminal_id=None,
+                duration_ms=duration_ms,
             )
 
         if response.status_code != 200:
@@ -807,36 +928,85 @@ async def _handoff_impl(
                 msg = f"Handoff timed out after {timeout} seconds"
             else:
                 msg = f"Handoff failed: {structured_detail}"
-            return HandoffResult(success=False, message=msg, output=None, terminal_id=tid)
+            duration_ms = _handoff_duration_ms(start_time)
+            outcome = (
+                "timeout"
+                if kind == "timeout" or (kind is None and response.status_code == 504)
+                else "failure"
+            )
+            _record_handoff_step_duration(
+                duration_ms,
+                provider=provider,
+                agent_profile=agent_profile,
+                model=model,
+                outcome=outcome,
+            )
+            return HandoffResult(
+                success=False,
+                message=msg,
+                output=None,
+                terminal_id=tid,
+                duration_ms=duration_ms,
+            )
 
         data = response.json()
         terminal_id = data.get("terminal_id")
         # A 200 must carry last_message; surface a malformed body as a failure
         # rather than silently returning success-with-None.
         if "last_message" not in data:
+            duration_ms = _handoff_duration_ms(start_time)
+            _record_handoff_step_duration(
+                duration_ms,
+                provider=provider,
+                agent_profile=agent_profile,
+                model=model,
+                outcome="failure",
+            )
             return HandoffResult(
                 success=False,
                 message="Handoff failed: malformed run-step response (no last_message)",
                 output=None,
                 terminal_id=terminal_id,
+                duration_ms=duration_ms,
             )
         output = data["last_message"]
 
-        execution_time = time.time() - start_time
+        duration_ms = _handoff_duration_ms(start_time)
+        _record_handoff_step_duration(
+            duration_ms,
+            provider=provider,
+            agent_profile=agent_profile,
+            model=model,
+            outcome="success",
+        )
+        execution_time = duration_ms / 1000.0
         return HandoffResult(
             success=True,
             message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
             + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
+            duration_ms=duration_ms,
         )
 
     except Exception as e:
         # Surface terminal_id when known. With the single-call design the server
         # owns the terminal lifecycle, so on a client-side failure (e.g. the
         # provider resolution) there is usually no terminal to surface.
+        duration_ms = _handoff_duration_ms(start_time)
+        _record_handoff_step_duration(
+            duration_ms,
+            provider=provider,
+            agent_profile=agent_profile,
+            model=model,
+            outcome="failure",
+        )
         return HandoffResult(
-            success=False, message=f"Handoff failed: {str(e)}", output=None, terminal_id=terminal_id
+            success=False,
+            message=f"Handoff failed: {str(e)}",
+            output=None,
+            terminal_id=terminal_id,
+            duration_ms=duration_ms,
         )
 
 
@@ -991,6 +1161,16 @@ def _assign_impl(
     """
     terminal_id: Optional[str] = None
     try:
+        # D6: reject before any create when child depth would reach the cap.
+        child_depth_or_err = _child_agent_depth_or_reject()
+        if isinstance(child_depth_or_err, str):
+            return {
+                "success": False,
+                "terminal_id": None,
+                "message": f"Assignment failed: {child_depth_or_err}",
+            }
+        child_depth = child_depth_or_err
+
         # Fail fast before creating the worker terminal when CAO_TERMINAL_ID is
         # unset — REGARDLESS of the sender-ID-injection flag. The deferred-init
         # path only forwards the initial message on the existing-session branch
@@ -1025,11 +1205,19 @@ def _assign_impl(
         else:
             worker_message = message
 
+        try:
+            from cli_agent_orchestrator.telemetry import record_spawn_depth
+
+            record_spawn_depth(child_depth, orchestration_type="assign")
+        except Exception:
+            pass
+
         # Create terminal in DEFERRED-INIT mode: cao-server returns as soon
         # as the tmux window is up and the DB row is written; the actual
         # provider.initialize() and initial-message delivery run as a
         # background task on the server. The tool-call typically returns
         # in under 2 seconds regardless of how long init takes.
+        # D6: pass CAO_AGENT_DEPTH so the child's MCP process can gate further spawns.
         terminal_id, _ = _create_terminal(
             agent_profile,
             working_directory,
@@ -1037,6 +1225,7 @@ def _assign_impl(
             initial_message=worker_message,
             initial_message_orchestration_type=OrchestrationType.ASSIGN,
             model=model,
+            env_vars={"CAO_AGENT_DEPTH": str(child_depth)},
         )
 
         return {
@@ -1484,6 +1673,27 @@ def _caller_has_store_lesson_capability(caller_profile: Optional[str]) -> bool:
         return "store_lesson" in (profile.capabilities or [])
     except Exception as e:  # noqa: BLE001 — authz check fails closed
         logger.warning(f"store_lesson capability lookup failed for {caller_profile!r}: {e}")
+        return False
+
+
+def _caller_has_get_terminal_transcript_capability(caller_profile: Optional[str]) -> bool:
+    """True when the caller's PROFILE declares ``get_terminal_transcript`` (D16).
+
+    Mirrors ``_caller_has_store_lesson_capability``: profile name from the
+    terminal record (never tool args), capability list from frontmatter,
+    fail-closed on any lookup error.
+    """
+    if not caller_profile:
+        return False
+    try:
+        from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile
+
+        profile = load_agent_profile(caller_profile)
+        return "get_terminal_transcript" in (profile.capabilities or [])
+    except Exception as e:  # noqa: BLE001 — authz check fails closed
+        logger.warning(
+            f"get_terminal_transcript capability lookup failed for {caller_profile!r}: {e}"
+        )
         return False
 
 
@@ -1935,6 +2145,97 @@ async def store_lesson(
         return {"success": False, "disabled": True, "error": str(e)}
     except Exception as e:
         return {"success": False, "error": str(e)}
+
+
+@mcp.tool()
+async def get_terminal_transcript(
+    terminal_id: str = Field(
+        description="Eight-character hex terminal ID whose on-disk transcript to read"
+    ),
+    max_chars: Optional[int] = Field(
+        default=None,
+        description=(
+            "Optional tail cap: when set and positive, return only the last "
+            "max_chars of the transcript (ops_mcp semantics)"
+        ),
+    ),
+) -> Dict[str, Any]:
+    """Read a peer terminal's on-disk transcript (D16).
+
+    Returns ``.log`` (preferred) or ``.scrollback`` under TERMINAL_LOG_DIR —
+    never the StatusMonitor rolling buffer / OutputMode.FULL / live tmux
+    capture. Capability-gated: the caller's profile (from CAO_TERMINAL_ID,
+    never tool args) must declare ``get_terminal_transcript`` in frontmatter.
+
+    HTTP-only boundary: calls ``GET /terminals/{id}/transcript`` with
+    ``X-CAO-Caller-Terminal-Id`` from the caller's ``CAO_TERMINAL_ID`` (D16
+    King arbitration vs auth-off bypass); does not import services/.
+    """
+    from cli_agent_orchestrator.mcp_server.utils import _auth_headers
+
+    try:
+        terminal_context = _get_terminal_context_from_env()
+        if not terminal_context:
+            return {
+                "success": False,
+                "error": "Could not resolve terminal context (CAO_TERMINAL_ID unset or unknown)",
+            }
+        caller_profile = terminal_context.get("agent_profile")
+        if not _caller_has_get_terminal_transcript_capability(caller_profile):
+            return {
+                "success": False,
+                "error": (
+                    f"caller profile {caller_profile!r} is not authorized to read "
+                    "terminal transcripts: requires the 'get_terminal_transcript' "
+                    "capability in the caller's profile frontmatter"
+                ),
+            }
+
+        params: Dict[str, Any] = {}
+        if max_chars is not None:
+            params["max_chars"] = max_chars
+
+        # D16 King arbitration: HTTP /transcript fail-closes without this
+        # caller TerminalId (auth-off scope gate alone is insufficient).
+        headers = dict(_auth_headers())
+        headers["X-CAO-Caller-Terminal-Id"] = terminal_context["terminal_id"]
+
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{terminal_id}/transcript",
+            params=params or None,
+            headers=headers,
+            timeout=_mcp_timeout(),
+        )
+        if response.status_code == 404:
+            detail = _extract_error_detail(response, "transcript not found")
+            return {"success": False, "error": detail, "terminal_id": terminal_id}
+        if response.status_code != 200:
+            detail = _extract_error_detail(response, f"status {response.status_code}")
+            return {"success": False, "error": detail, "terminal_id": terminal_id}
+
+        data = response.json()
+        if not isinstance(data, dict) or not isinstance(data.get("output"), str):
+            return {
+                "success": False,
+                "error": "invalid transcript response payload",
+                "terminal_id": terminal_id,
+            }
+        return {
+            "success": True,
+            "output": data["output"],
+            "truncated": bool(data.get("truncated", False)),
+            "total_chars": int(data.get("total_chars", len(data["output"]))),
+            "terminal_id": data.get("terminal_id", terminal_id),
+            "source": data.get("source"),
+        }
+    except requests.ConnectionError:
+        return {
+            "success": False,
+            "error": "Failed to connect to cao-server. The server may not be running.",
+            "terminal_id": terminal_id,
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "terminal_id": terminal_id}
 
 
 @mcp.tool()

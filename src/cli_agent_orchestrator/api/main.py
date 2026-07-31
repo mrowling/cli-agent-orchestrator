@@ -121,7 +121,11 @@ from cli_agent_orchestrator.services.profile_search import (
 )
 from cli_agent_orchestrator.services.status_monitor import status_monitor
 from cli_agent_orchestrator.services.step_output_store import _validate_key_part
-from cli_agent_orchestrator.services.terminal_service import OutputMode, TerminalInputBlockedError
+from cli_agent_orchestrator.services.terminal_service import (
+    OutputMode,
+    TerminalCapacityError,
+    TerminalInputBlockedError,
+)
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
 from cli_agent_orchestrator.utils.logging import install_access_log_redaction, setup_logging
@@ -196,6 +200,66 @@ class TerminalOutputResponse(BaseModel):
     mode: str
 
 
+class TerminalTranscriptResponse(BaseModel):
+    """D16: on-disk transcript (``.log`` / ``.scrollback``), not OutputMode.FULL."""
+
+    output: str
+    truncated: bool
+    total_chars: int
+    terminal_id: str
+    source: str  # "log" | "scrollback"
+
+
+# D16 King arbitration: HTTP transcript must prove a capable caller even when
+# auth is default-off (scope gate alone is a no-op then). Header is the *caller*
+# TerminalId, not the target being read.
+_TERMINAL_ID_HEADER_RE = re.compile(r"^[a-f0-9]{8}$")
+
+
+def require_transcript_caller_capability(
+    x_cao_caller_terminal_id: Optional[str] = Header(
+        default=None, alias="X-CAO-Caller-Terminal-Id"
+    ),
+) -> str:
+    """Fail-closed gate for GET /terminals/{id}/transcript (D16).
+
+    Requires ``X-CAO-Caller-Terminal-Id`` of a registered terminal whose
+    ``agent_profile`` declares ``get_terminal_transcript`` (same semantics as
+    the MCP helper / ``store_lesson``). Missing/invalid header, unknown
+    terminal, or missing capability → 403. Complements
+    ``require_any_scope(SCOPE_READ, …)`` which is a no-op when auth is off.
+    """
+    detail = (
+        "transcript access requires X-CAO-Caller-Terminal-Id of a terminal "
+        "whose agent profile declares get_terminal_transcript (D16; King "
+        "arbitration vs auth-off bypass)"
+    )
+    if not x_cao_caller_terminal_id or not _TERMINAL_ID_HEADER_RE.fullmatch(
+        x_cao_caller_terminal_id
+    ):
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    meta = get_terminal_metadata(x_cao_caller_terminal_id)
+    if not meta:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    profile_name = meta.get("agent_profile")
+    if not profile_name:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    try:
+        profile = load_agent_profile(profile_name)
+        if "get_terminal_transcript" not in (profile.capabilities or []):
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+    except HTTPException:
+        raise
+    except Exception:
+        # Fail closed on profile load / parse errors (mirror MCP store_lesson).
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail=detail)
+
+    return x_cao_caller_terminal_id
+
+
 class CreateTerminalBody(BaseModel):
     """Optional JSON body for POST /sessions/{name}/terminals.
 
@@ -204,10 +268,15 @@ class CreateTerminalBody(BaseModel):
     strings are routinely captured in HTTP access logs and traces). Routing
     fields (provider, defer_init, etc.) stay as query params; only the
     message content lives here.
+
+    ``env_vars`` (D6): optional per-window env (e.g. ``CAO_AGENT_DEPTH``)
+    merged onto the session env when the window is created — same shape as
+    ``CreateSessionBody.env_vars`` / run-step allowlisted keys.
     """
 
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
+    env_vars: Optional[Dict[str, str]] = None
 
 
 class CreateSessionBody(CreateTerminalBody):
@@ -2161,12 +2230,20 @@ async def create_terminal_in_session(
             initial_message=initial_message,
             initial_message_orchestration_type=orch_type,
             model=model,
+            env_vars=body.env_vars if body else None,
         )
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
         # orchestration_type) — propagate as-is instead of masking as a 500.
         raise
+    except TerminalCapacityError as e:
+        # D7: distinguishable capacity rejection with retry hint.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(e),
+            headers={"Retry-After": "5"},
+        )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -2319,7 +2396,10 @@ async def send_terminal_key(
 
 @app.get("/terminals/{terminal_id}/output", response_model=TerminalOutputResponse)
 async def get_terminal_output(
-    terminal_id: TerminalId, mode: OutputMode = OutputMode.FULL
+    terminal_id: TerminalId,
+    mode: OutputMode = OutputMode.FULL,
+    # D16: close ungated hole — same read-floor scopes as /transcript.
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
 ) -> TerminalOutputResponse:
     try:
         # get_output does a blocking tmux capture-pane plus provider regex
@@ -2333,6 +2413,42 @@ async def get_terminal_output(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get output: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/transcript", response_model=TerminalTranscriptResponse)
+async def get_terminal_transcript(
+    terminal_id: TerminalId,
+    max_chars: Optional[int] = Query(
+        default=None,
+        description=(
+            "Optional tail cap (ops_mcp semantics): when set and positive, return "
+            "only the last max_chars of the on-disk transcript."
+        ),
+    ),
+    # D16: read-floor scopes (match /graph and dashboard read surfaces).
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+    # D16 King arbitration: capability proof even when auth is default-off.
+    _caller: str = Depends(require_transcript_caller_capability),
+) -> TerminalTranscriptResponse:
+    """Return on-disk terminal transcript (``.log`` preferred, else ``.scrollback``).
+
+    D16: never uses OutputMode.FULL / StatusMonitor / tmux capture. Path is
+    resolved solely from TerminalId under TERMINAL_LOG_DIR (fail closed).
+    Not a public dump: requires ``X-CAO-Caller-Terminal-Id`` whose profile
+    declares ``get_terminal_transcript`` (King arbitration vs auth-off bypass).
+    """
+    try:
+        result = await asyncio.to_thread(
+            terminal_service.read_terminal_transcript, terminal_id, max_chars
+        )
+        return TerminalTranscriptResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get transcript: {str(e)}",
         )
 
 
@@ -2500,6 +2616,13 @@ async def run_step(
         raise HTTPException(
             status_code=status.HTTP_504_GATEWAY_TIMEOUT,
             detail={"message": str(e), "kind": "timeout", "terminal_id": None},
+        )
+    except TerminalCapacityError as e:
+        # D7: capacity gate fires inside create_terminal on the handoff path.
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail=str(e),
+            headers={"Retry-After": "5"},
         )
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.

@@ -46,6 +46,15 @@ with t.execute_tool_span("tool-1") as span:
     assert span is None
 with t.chat_span("model-1") as span:
     assert span is None
+t.record_orchestration_dispatch("handoff")
+t.record_agent_step_duration(
+    100, provider="p", agent_profile="a", model="m", role="r", outcome="success"
+)
+t.adjust_active_terminals(1, session="s", provider="p")
+t.record_spawn_depth(1, orchestration_type="handoff")
+t.record_step_attempts(1, agent_profile="a")
+t.record_review_rejection(reviewer_profile="r", reviewer_model="m", lens="code")
+t.record_repo_collision(kind="multi_terminal_file")
 
 print("OK")
 """
@@ -172,6 +181,15 @@ def test_telemetry_fallback_covered_in_process(monkeypatch) -> None:
             assert span is None
         with t.chat_span("model-1", conversation_id="c1") as span:
             assert span is None
+        t.record_orchestration_dispatch("handoff")
+        t.record_agent_step_duration(
+            100, provider="p", agent_profile="a", model="m", role="r", outcome="success"
+        )
+        t.adjust_active_terminals(1, session="s", provider="p")
+        t.record_spawn_depth(1, orchestration_type="handoff")
+        t.record_step_attempts(1, agent_profile="a")
+        t.record_review_rejection(reviewer_profile="r", reviewer_model="m", lens="code")
+        t.record_repo_collision(kind="multi_terminal_file")
     finally:
         sys.meta_path[:] = saved_meta
         for n in _tel_modules():

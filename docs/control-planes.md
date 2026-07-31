@@ -15,7 +15,9 @@ caller can use.
 
 These surfaces manage CAO from outside a session. The separate
 `cao-mcp-server` is an orthogonal, in-session surface through which CAO agents
-coordinate with tools such as `handoff`, `assign`, and `send_message`. See the
+coordinate with tools such as `handoff`, `assign`, `send_message`, and
+(capability-gated) `get_terminal_transcript` for peer on-disk transcripts
+(D16). See the
 [core MCP tools](../skills/cao-supervisor-protocols/SKILL.md#core-mcp-tools)
 and the guide to
 [choosing between assign and handoff](../skills/cao-supervisor-protocols/SKILL.md#choosing-between-assign-and-handoff).
@@ -86,6 +88,12 @@ The current tools are grouped by purpose:
 - Terminal inspection: `read_session_output`, `get_terminal_status`,
   `get_terminal_output`
 - Session lifecycle: `list_sessions`, `get_session_info`, `shutdown_session`
+
+For **in-session** peer transcript review (capability-gated
+`get_terminal_transcript` on `cao-mcp-server`, reading on-disk `.log` /
+`.scrollback` via `GET /terminals/{id}/transcript`), see [API](api.md) and
+the `reviewer_transcript` profile (D16/D17). That tool is not part of
+`cao-ops-mcp`; ops inspection remains the operator-facing surface above.
 
 MCP tool discovery is authoritative for clients. The declarations in
 [`ops_mcp_server/server.py`](../src/cli_agent_orchestrator/ops_mcp_server/server.py)

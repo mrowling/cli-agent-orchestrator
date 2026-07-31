@@ -912,10 +912,12 @@ class TestCreateTerminalEnvVars:
 
         extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
         # Both the persisted session env AND the per-step vars are present.
+        # D6: CAO_AGENT_DEPTH defaults to "0" when the caller omits it.
         assert extra_env == {
             "SESSION_VAR": "from-session",
             "CAO_WORKFLOW_RUN_ID": "run-1",
             "CAO_WORKFLOW_STEP_ID": "s1",
+            "CAO_AGENT_DEPTH": "0",
         }
 
     @pytest.mark.asyncio
@@ -996,8 +998,8 @@ class TestCreateTerminalEnvVars:
         mock_status_monitor,
         mock_get_session_env,
     ):
-        """env_vars=None on new_session=False: the window still gets exactly the
-        persisted session env (pre-#408 behavior preserved)."""
+        """env_vars=None on new_session=False: the window still gets the
+        persisted session env, plus D6's default CAO_AGENT_DEPTH=0."""
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         self._wire_happy_mocks(
             mock_gen_id,
@@ -1015,7 +1017,7 @@ class TestCreateTerminalEnvVars:
         )
 
         extra_env = mock_tmux.create_window.call_args.kwargs["extra_env"]
-        assert extra_env == {"SESSION_VAR": "from-session"}
+        assert extra_env == {"SESSION_VAR": "from-session", "CAO_AGENT_DEPTH": "0"}
 
     @pytest.mark.asyncio
     @patch("cli_agent_orchestrator.services.terminal_service.set_session_env")
@@ -1043,8 +1045,8 @@ class TestCreateTerminalEnvVars:
         mock_status_monitor,
         mock_set_session_env,
     ):
-        """new_session=True is untouched by #408: env_vars go verbatim to
-        create_session's extra_env and are persisted via set_session_env."""
+        """new_session=True: env_vars reach create_session's extra_env (D6 also
+        injects CAO_AGENT_DEPTH=0 when the caller omits it)."""
         mock_load_profile.return_value = AgentProfile(name="developer", description="Developer")
         self._wire_happy_mocks(
             mock_gen_id,
@@ -1063,8 +1065,13 @@ class TestCreateTerminalEnvVars:
             env_vars={"FOO": "bar"},
         )
 
-        assert mock_tmux.create_session.call_args.kwargs["extra_env"] == {"FOO": "bar"}
-        mock_set_session_env.assert_called_once_with("cao-session", {"FOO": "bar"})
+        assert mock_tmux.create_session.call_args.kwargs["extra_env"] == {
+            "FOO": "bar",
+            "CAO_AGENT_DEPTH": "0",
+        }
+        mock_set_session_env.assert_called_once_with(
+            "cao-session", {"FOO": "bar", "CAO_AGENT_DEPTH": "0"}
+        )
         mock_tmux.create_window.assert_not_called()
 
 

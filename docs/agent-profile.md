@@ -36,7 +36,12 @@ portable and make profile listings useful.
 - `allowedTools` (array of strings): explicit CAO tool allowlist; when present,
   it overrides the role defaults.
 - `capabilities` (array of strings): profile-discovery statements, with at most
-  32 strings and 128 characters per string.
+  32 strings and 128 characters per string. Two tokens are also used as
+  **authorization gates** on MCP tools (fail-closed, resolved from the caller's
+  profile frontmatter — never from tool arguments):
+  - `store_lesson` — cross-agent lesson writes (built-in `retrospector`)
+  - `get_terminal_transcript` — peer on-disk transcript reads (built-in
+    `reviewer_transcript`; D16)
 - `tags` (array of strings): profile-discovery keywords, with at most 32 values;
   each value must match `A-Za-z0-9_-` and contain at most 64 characters.
 - `skills` (array of strings): exact names or case-sensitive
@@ -127,6 +132,14 @@ cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/mai
 
 Packaged examples are available in the
 [agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
+
+Built-in review lenses (D17) meant to be stacked by `code_supervisor`:
+
+| Profile | Lens |
+| --- | --- |
+| `reviewer` | Code only (unchanged) |
+| `reviewer_transcript` | Worker transcript via `get_terminal_transcript` (D16) |
+| `reviewer_adversarial` | Code lens; supervisors pass a different `model=` on handoff/assign |
 
 ### Profile discovery
 

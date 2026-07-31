@@ -272,6 +272,8 @@ def test_mcp_registration_writes_config(tmp_path, monkeypatch):
         assert "cao-mcp-server" in data["mcpServers"]
         # CAO_TERMINAL_ID forwarded so cao-mcp-server can resolve the terminal.
         assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+        # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
+        assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
         # cleanup removes our entry without clobbering the file.
         p.cleanup()
         data2 = json.loads(cfg.read_text())
@@ -440,6 +442,7 @@ def test_mcp_registration_accepts_pydantic_mcpserver(tmp_path):
         p._build_agy_command()
     data = json.loads(cfg.read_text())
     assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+    assert data["mcpServers"]["cao-mcp-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
     assert data["mcpServers"]["other"]["command"] == "keep"  # untouched
 
 

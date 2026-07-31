@@ -378,10 +378,13 @@ class KimiCliProvider(BaseProvider):
                         # can identify the current terminal for handoff/assign operations.
                         # Kimi CLI does not automatically forward parent shell env vars
                         # to MCP subprocesses, so we inject it explicitly via the env field.
-                        env = mcp_config[server_name].get("env", {})
+                        # D6: likewise forward CAO_AGENT_DEPTH for spawn-depth gating.
+                        env = dict(mcp_config[server_name].get("env") or {})
                         if "CAO_TERMINAL_ID" not in env:
                             env["CAO_TERMINAL_ID"] = self.terminal_id
-                            mcp_config[server_name]["env"] = env
+                        if "CAO_AGENT_DEPTH" not in env:
+                            env["CAO_AGENT_DEPTH"] = os.environ.get("CAO_AGENT_DEPTH", "0")
+                        mcp_config[server_name]["env"] = env
 
                     command_parts.extend(["--mcp-config", json.dumps(mcp_config)])
 

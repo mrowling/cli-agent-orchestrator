@@ -781,6 +781,27 @@ class TestCreateTerminalInSession:
         assert response.status_code == 500
         assert "Failed to create terminal" in response.json()["detail"]
 
+    def test_create_terminal_returns_429_at_capacity(self, client):
+        """POST /sessions/{name}/terminals returns 429 + Retry-After on D7 capacity."""
+        from cli_agent_orchestrator.services.terminal_service import TerminalCapacityError
+
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.create_terminal = AsyncMock(
+                side_effect=TerminalCapacityError("cao-busy", 12, 12)
+            )
+
+            response = client.post(
+                "/sessions/cao-busy/terminals",
+                params={
+                    "provider": "claude_code",
+                    "agent_profile": "developer",
+                },
+            )
+
+        assert response.status_code == 429
+        assert response.headers.get("Retry-After") == "5"
+        assert "capacity" in response.json()["detail"].lower()
+
 
 class TestListTerminalsInSession:
     """Tests for GET /sessions/{session_name}/terminals endpoint."""

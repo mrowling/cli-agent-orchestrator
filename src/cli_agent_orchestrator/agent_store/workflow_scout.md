@@ -1,7 +1,7 @@
 ---
 name: workflow_scout
 description: Read-only locator for existing CAO workflow specs
-role: workflow_scout  # @builtin, fs_read, execute_bash, @cao-mcp-server
+role: workflow_scout  # registered in ROLE_TOOL_DEFAULTS: @builtin, fs_read, execute_bash, @cao-mcp-server
 mcpServers:
   cao-mcp-server:
     type: stdio

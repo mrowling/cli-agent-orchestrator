@@ -705,6 +705,8 @@ class TestKimiCliProviderBuildCommand:
 
         assert config["test-server"]["env"]["MY_VAR"] == "my_value"
         assert config["test-server"]["env"]["CAO_TERMINAL_ID"] == "abc123"
+        # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
+        assert config["test-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
 
     @patch("cli_agent_orchestrator.providers.kimi_cli.load_agent_profile")
     def test_build_command_mcp_does_not_override_existing_terminal_id(self, mock_load):

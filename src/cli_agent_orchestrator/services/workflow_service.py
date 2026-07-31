@@ -54,6 +54,8 @@ from cli_agent_orchestrator.models.workflow_runtime import (
     StepResult,
     StepStatus,
     WorkflowRunResult,
+    duration_ms_between,
+    step_finished_at,
 )
 from cli_agent_orchestrator.services import workflow_journal
 from cli_agent_orchestrator.services.agent_step import (
@@ -141,6 +143,8 @@ class StepRunState:
     error: Optional[str] = None
     which_guard_fired: Optional[str] = None  # RESERVED (N8) — always None in MVP
     iterations_run: Optional[int] = None  # RESERVED (N8) — always None in MVP
+    started_at: Optional[str] = None  # D1: journaled on RUNNING transition
+    updated_at: Optional[str] = None  # D1: last journal mutation; maps to finished_at when terminal
 
 
 @dataclass
@@ -262,15 +266,21 @@ def _journal_insert_run(record: RunRecord) -> None:
 def _journal_step(record: RunRecord, step_id: str) -> None:
     """Best-effort UPDATE of one step's durable state from the in-memory record."""
     st = record.step_states[step_id]
+    now = _now()
+    # D1: stamp started_at once on the first RUNNING transition (in-memory + journal).
+    if st.state == StepState.RUNNING and st.started_at is None:
+        st.started_at = now
+    st.updated_at = now
     try:
         workflow_journal.update_step(
             run_id=record.run_id,
             step_id=step_id,
             state=st.state.value,
             attempts=st.attempts,
-            updated_at=_now(),
+            updated_at=now,
             output_json=_output_json(st.output),
             error=st.error,
+            started_at=st.started_at,  # D1: backfill NULL journal rows via COALESCE
         )
     except (
         Exception
@@ -645,20 +655,24 @@ async def _skip_remaining(record: RunRecord, order: List[WorkflowStep], from_ind
             await _ajournal(_journal_step, record, step.id)  # §1: persist the skip
 
 
+def _step_result(step_id: str, st: StepRunState) -> StepResult:
+    """Build a ``StepResult`` with D1 timing fields from in-memory step state."""
+    finished_at = step_finished_at(st.state, st.updated_at)
+    return StepResult(
+        id=step_id,
+        state=st.state,
+        attempts=st.attempts,
+        output=st.output.output if st.output is not None else None,
+        error=st.error,
+        started_at=st.started_at,
+        finished_at=finished_at,
+        duration_ms=duration_ms_between(st.started_at, finished_at),
+    )
+
+
 def _build_result(record: RunRecord, order: List[WorkflowStep]) -> WorkflowRunResult:
     """Aggregate a ``RunRecord`` into the run's ``WorkflowRunResult`` (§1 step 8)."""
-    steps: List[StepResult] = []
-    for step in order:
-        st = record.step_states[step.id]
-        steps.append(
-            StepResult(
-                id=step.id,
-                state=st.state,
-                attempts=st.attempts,
-                output=st.output.output if st.output is not None else None,
-                error=st.error,
-            )
-        )
+    steps: List[StepResult] = [_step_result(step.id, record.step_states[step.id]) for step in order]
     return WorkflowRunResult(
         run_id=record.run_id,
         workflow_name=record.workflow_name,
@@ -994,6 +1008,8 @@ def _rebuild_record_from_journal(run_id: str) -> Optional[RunRecord]:
                 attempts=srow.attempts,
                 output=_record_from_json(srow.output_json),
                 error=srow.error,
+                started_at=srow.started_at,  # D1: restored from journal (NULL on pre-D1 rows)
+                updated_at=srow.updated_at,
             )
         except ValueError as e:
             # Unknown ``state`` value etc. — one bad row must never abort the

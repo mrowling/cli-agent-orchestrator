@@ -45,6 +45,15 @@ role: supervisor
 | `supervisor` | `@cao-mcp-server`, `fs_read`, `fs_list` | Orchestrate workers + read files for context |
 | `developer` | `@builtin`, `fs_*`, `execute_bash`, `web_fetch`, `@cao-mcp-server` | Full access: read, write, execute, fetch, orchestrate |
 | `reviewer` | `@builtin`, `fs_read`, `fs_list`, `@cao-mcp-server` | Read-only: review code, no writes, execution, or network |
+| `workflow_scout` | `@builtin`, `fs_read`, `execute_bash`, `@cao-mcp-server` | Read-oriented locator for workflow specs (`cao workflow list` / `get`) |
+
+#### Unknown roles fail closed (D9)
+
+An unrecognized `role` **no longer** resolves to unrestricted `["*"]`. Tool
+resolution raises a clear error at profile load / launch time. Register custom
+roles under `agents.roles` in `settings.json` (or via
+`settings_service.set_agent_roles` / `cao config set agents.roles.<name> ...`),
+or set `allowedTools` explicitly on the profile.
 
 #### Custom Roles
 
@@ -52,12 +61,17 @@ Define your own roles in `~/.aws/cli-agent-orchestrator/settings.json`:
 
 ```json
 {
-  "roles": {
-    "data_analyst": ["fs_read", "execute_bash", "@cao-mcp-server"],
-    "secure_dev": ["fs_read", "fs_write", "@cao-mcp-server"]
+  "agents": {
+    "roles": {
+      "data_analyst": ["fs_read", "execute_bash", "@cao-mcp-server"],
+      "secure_dev": ["fs_read", "fs_write", "@cao-mcp-server"]
+    }
   }
 }
 ```
+
+The legacy flat `"roles": { ... }` key is still read for compatibility; new
+writes go to nested `agents.roles` (and mirror the flat key).
 
 Then use them in any profile:
 

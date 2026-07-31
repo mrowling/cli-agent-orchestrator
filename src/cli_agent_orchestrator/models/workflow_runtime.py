@@ -15,10 +15,11 @@ existing ``from ...models.workflow import StepState`` call sites are unaffected.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Any, Dict, List, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class StepState(str, Enum):
@@ -45,6 +46,40 @@ class RunState(str, Enum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+# D1 (swarm-economics): terminal step states used to map finished_at from updated_at.
+_TERMINAL_STEP_STATES = frozenset(
+    {
+        StepState.COMPLETED,
+        StepState.COMPLETED_UNVALIDATED,
+        StepState.FAILED,
+        StepState.SKIPPED,
+    }
+)
+
+
+def duration_ms_between(started_at: Optional[str], finished_at: Optional[str]) -> Optional[int]:
+    """Wall-clock duration in milliseconds when both ISO-8601 timestamps are present (D1)."""
+    if not started_at or not finished_at:
+        return None
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        finish = datetime.fromisoformat(finished_at.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=timezone.utc)
+    if finish.tzinfo is None:
+        finish = finish.replace(tzinfo=timezone.utc)
+    return int((finish - start).total_seconds() * 1000)
+
+
+def step_finished_at(state: StepState, updated_at: Optional[str]) -> Optional[str]:
+    """Map StepResult.finished_at from journal updated_at when the step is terminal (D1)."""
+    if state in _TERMINAL_STEP_STATES:
+        return updated_at
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -147,6 +182,11 @@ class StepResult(BaseModel):
     attempts: int
     output: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
+    # D1 (swarm-economics): step timing — started_at is journaled; finished_at is
+    # derived from updated_at on terminal states (no separate finished_at column).
+    started_at: Optional[str] = None
+    finished_at: Optional[str] = None
+    duration_ms: Optional[int] = None
 
 
 class WorkflowRunResult(BaseModel):
@@ -169,3 +209,9 @@ class WorkflowRunResult(BaseModel):
     kind: Optional[str] = None  # error|timeout|cancelled; None on COMPLETED (BR-3, Q1=A)
     output: Optional[Any] = None  # last-match CAO_WORKFLOW_OUTPUT: JSON (BR-7/8/9, Q2=A)
     warnings: List[str] = Field(default_factory=list)  # e.g. "malformed sentinel payload" (BR-9)
+
+    @computed_field  # type: ignore[prop-decorator]  # pydantic v2: @property under @computed_field
+    @property
+    def duration_ms(self) -> Optional[int]:
+        """Wall-clock run duration in milliseconds when both timestamps are present (D1)."""
+        return duration_ms_between(self.started_at, self.finished_at)

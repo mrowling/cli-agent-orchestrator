@@ -387,6 +387,7 @@ class ClaudeCodeProvider(BaseProvider):
             # can identify the current terminal for handoff/assign operations.
             # Claude Code does not automatically forward parent shell env vars
             # to MCP subprocesses, so we inject it explicitly via the env field.
+            # D6: likewise forward CAO_AGENT_DEPTH for spawn-depth gating.
             if profile.mcpServers:
                 mcp_config = {}
                 for server_name, server_config in profile.mcpServers.items():
@@ -399,10 +400,12 @@ class ClaudeCodeProvider(BaseProvider):
                     # PATH-independent invocation.
                     mcp_config[server_name] = resolve_mcp_server_config(mcp_config[server_name])
 
-                    env = mcp_config[server_name].get("env", {})
+                    env = dict(mcp_config[server_name].get("env") or {})
                     if "CAO_TERMINAL_ID" not in env:
                         env["CAO_TERMINAL_ID"] = self.terminal_id
-                        mcp_config[server_name]["env"] = env
+                    if "CAO_AGENT_DEPTH" not in env:
+                        env["CAO_AGENT_DEPTH"] = os.environ.get("CAO_AGENT_DEPTH", "0")
+                    mcp_config[server_name]["env"] = env
 
                 tmp_dir = CAO_HOME_DIR / "tmp"
                 tmp_dir.mkdir(parents=True, exist_ok=True)

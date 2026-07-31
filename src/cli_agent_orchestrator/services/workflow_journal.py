@@ -68,6 +68,7 @@ class StepRow:
     error: Optional[str]
     updated_at: str
     call_fingerprint: Optional[str] = None
+    started_at: Optional[str] = None  # D1: set on RUNNING transition; NULL on pre-D1 rows
 
 
 def _connect() -> sqlite3.Connection:
@@ -161,15 +162,29 @@ def update_step(
     updated_at: str,
     output_json: Optional[str] = None,
     error: Optional[str] = None,
+    started_at: Optional[str] = None,
 ) -> None:
-    """UPDATE a step's durable state/attempts/output/error (lifecycle table, E2)."""
+    """UPDATE a step's durable state/attempts/output/error (lifecycle table, E2).
+
+    When ``started_at`` is provided (D1), backfills the column only while it is
+    currently NULL (``COALESCE`` — a prior journaled start time is never overwritten).
+    """
     with _connect() as conn:
-        conn.execute(
-            "UPDATE workflow_run_step "
-            "SET state = ?, attempts = ?, output_json = ?, error = ?, updated_at = ? "
-            "WHERE run_id = ? AND step_id = ?",
-            (state, attempts, output_json, error, updated_at, run_id, step_id),
-        )
+        if started_at is not None:
+            conn.execute(
+                "UPDATE workflow_run_step "
+                "SET state = ?, attempts = ?, output_json = ?, error = ?, "
+                "updated_at = ?, started_at = COALESCE(started_at, ?) "
+                "WHERE run_id = ? AND step_id = ?",
+                (state, attempts, output_json, error, updated_at, started_at, run_id, step_id),
+            )
+        else:
+            conn.execute(
+                "UPDATE workflow_run_step "
+                "SET state = ?, attempts = ?, output_json = ?, error = ?, updated_at = ? "
+                "WHERE run_id = ? AND step_id = ?",
+                (state, attempts, output_json, error, updated_at, run_id, step_id),
+            )
 
 
 def update_run_current_step(run_id: str, current_step_id: Optional[str]) -> None:
@@ -231,7 +246,7 @@ def get_steps(run_id: str) -> List[StepRow]:
     with _connect() as conn:
         rows = conn.execute(
             "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
-            "call_fingerprint "
+            "call_fingerprint, started_at "
             "FROM workflow_run_step WHERE run_id = ?",
             (run_id,),
         ).fetchall()
@@ -245,6 +260,7 @@ def get_steps(run_id: str) -> List[StepRow]:
             error=r[5],
             updated_at=r[6],
             call_fingerprint=r[7],
+            started_at=r[8],
         )
         for r in rows
     ]
@@ -259,7 +275,7 @@ def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
     with _connect() as conn:
         row = conn.execute(
             "SELECT run_id, step_id, state, attempts, output_json, error, updated_at, "
-            "call_fingerprint "
+            "call_fingerprint, started_at "
             "FROM workflow_run_step WHERE run_id = ? AND step_id = ?",
             (run_id, step_id),
         ).fetchone()
@@ -274,6 +290,7 @@ def get_step(run_id: str, step_id: str) -> Optional[StepRow]:
         error=row[5],
         updated_at=row[6],
         call_fingerprint=row[7],
+        started_at=row[8],
     )
 
 
@@ -287,6 +304,7 @@ def append_step(
     state: str,
     updated_at: str,
     call_fingerprint: str,
+    started_at: Optional[str] = None,
 ) -> None:
     """Write-through append for a script call (A1, business-logic-model §A1).
 
@@ -310,11 +328,12 @@ def append_step(
         conn.execute(
             "INSERT INTO workflow_run_step "
             "(run_id, step_id, state, attempts, output_json, error, updated_at, "
-            " call_fingerprint) "
-            "VALUES (?, ?, ?, 0, NULL, NULL, ?, ?) "
+            " call_fingerprint, started_at) "
+            "VALUES (?, ?, ?, 0, NULL, NULL, ?, ?, ?) "
             "ON CONFLICT(run_id, step_id) DO UPDATE SET "
-            "state = excluded.state, updated_at = excluded.updated_at",
-            (run_id, step_id, state, updated_at, call_fingerprint),
+            "state = excluded.state, updated_at = excluded.updated_at, "
+            "started_at = COALESCE(workflow_run_step.started_at, excluded.started_at)",
+            (run_id, step_id, state, updated_at, call_fingerprint, started_at),
         )
 
 

@@ -58,3 +58,17 @@ class TestHandoffResult:
         assert data["message"] == "Test"
         assert data["output"] == "Output"
         assert data["terminal_id"] == "term-789"
+        assert data["duration_ms"] is None
+
+    def test_handoff_result_with_duration_ms(self):
+        """D2: duration_ms is surfaced on HandoffResult."""
+        result = HandoffResult(
+            success=True,
+            message="Done",
+            output="Output",
+            terminal_id="term-001",
+            duration_ms=1234,
+        )
+
+        assert result.duration_ms == 1234
+        assert result.model_dump()["duration_ms"] == 1234

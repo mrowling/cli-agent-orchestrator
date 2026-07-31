@@ -767,6 +767,8 @@ class TestBuildCommand:
         servers = manifest["mcpServers"]
         assert "cao-mcp-server" in servers
         assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+        # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
+        assert servers["cao-mcp-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_mcp_resolves_bundled_command_in_manifest(self, mock_load):

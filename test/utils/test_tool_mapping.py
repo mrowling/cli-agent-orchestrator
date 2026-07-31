@@ -59,6 +59,31 @@ class TestResolveAllowedTools:
         result = resolve_allowed_tools(["*"], "supervisor")
         assert result == ["*"]
 
+    def test_unknown_role_fails_closed(self):
+        """D9: unknown role raises instead of resolving to unrestricted ['*']."""
+        with pytest.raises(ValueError, match="Unknown role 'totally_fake_role'"):
+            resolve_allowed_tools(None, "totally_fake_role")
+
+    def test_workflow_scout_role_defaults(self):
+        """D9: workflow_scout is a registered built-in (read-oriented + bash)."""
+        result = resolve_allowed_tools(None, "workflow_scout")
+        assert result == ["@builtin", "fs_read", "execute_bash", "@cao-mcp-server"]
+        assert "*" not in result
+
+    def test_custom_role_from_settings(self, monkeypatch):
+        """D9: custom roles registered via agents.roles resolve normally."""
+        monkeypatch.setattr(
+            "cli_agent_orchestrator.services.settings_service.get_agent_roles",
+            lambda: {"data_analyst": ["fs_read", "execute_bash"]},
+        )
+        result = resolve_allowed_tools(None, "data_analyst")
+        assert result == ["fs_read", "execute_bash"]
+
+    def test_explicit_tools_bypass_unknown_role(self):
+        """Explicit allowedTools still win even when role is unrecognized."""
+        result = resolve_allowed_tools(["fs_read"], "not_a_real_role")
+        assert result == ["fs_read"]
+
 
 class TestGetDisallowedTools:
     """Tests for get_disallowed_tools."""

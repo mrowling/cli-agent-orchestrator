@@ -514,6 +514,13 @@ def _migrate_workflow_run_step() -> None:
                     "ALTER TABLE workflow_run_step ADD COLUMN call_fingerprint TEXT DEFAULT NULL"
                 )
                 logger.info("Migration: added call_fingerprint column to workflow_run_step")
+            # D1 (swarm-economics): step start time — journaled so duration survives resume.
+            # Unlike reprompted/terminal_id (in-memory-only, F3), started_at MUST persist.
+            if "started_at" not in columns:
+                conn.execute(
+                    "ALTER TABLE workflow_run_step ADD COLUMN started_at TEXT DEFAULT NULL"
+                )
+                logger.info("Migration: added started_at column to workflow_run_step")
     except Exception as e:  # noqa: BLE001 — derived/recoverable; logged at debug (B4-RD-4)
         logger.debug(f"workflow_run_step migration skipped: {e}")
 

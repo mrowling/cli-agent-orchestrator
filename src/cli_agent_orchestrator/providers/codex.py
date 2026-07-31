@@ -420,9 +420,12 @@ class CodexProvider(BaseProvider):
                     # can identify the current session for handoff/assign operations.
                     # Codex does not forward env vars to MCP subprocesses by default;
                     # env_vars lists names to inherit from the parent shell environment.
+                    # D6: likewise inherit CAO_AGENT_DEPTH for spawn-depth gating.
                     env_vars = cfg.get("env_vars", [])
                     if "CAO_TERMINAL_ID" not in env_vars:
                         env_vars = list(env_vars) + ["CAO_TERMINAL_ID"]
+                    if "CAO_AGENT_DEPTH" not in env_vars:
+                        env_vars = list(env_vars) + ["CAO_AGENT_DEPTH"]
                     env_vars_toml = "[" + ", ".join(_toml_scalar(v) for v in env_vars) + "]"
                     command_parts.extend(["-c", f"{prefix}.env_vars={env_vars_toml}"])
                     # Set a generous tool timeout for MCP calls like handoff, which

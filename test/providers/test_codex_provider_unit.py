@@ -182,6 +182,8 @@ class TestCodexBuildCommand:
         # CAO_TERMINAL_ID must be forwarded for handoff to work
         assert "mcp_servers.cao-mcp-server.env_vars=" in command
         assert "CAO_TERMINAL_ID" in command
+        # D6: CAO_AGENT_DEPTH inherited for spawn-depth gating
+        assert "CAO_AGENT_DEPTH" in command
         # Tool timeout must be a TOML float (600.0) for Codex's f64 deserializer
         assert "mcp_servers.cao-mcp-server.tool_timeout_sec=600.0" in command
 
@@ -318,6 +320,8 @@ class TestCodexBuildCommand:
         # CAO_TERMINAL_ID always forwarded even without explicit env_vars
         assert "mcp_servers.test-server.env_vars=" in command
         assert "CAO_TERMINAL_ID" in command
+        # D6: CAO_AGENT_DEPTH inherited for spawn-depth gating
+        assert "CAO_AGENT_DEPTH" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_mcp_preserves_existing_env_vars(self, mock_load_profile):
@@ -337,10 +341,11 @@ class TestCodexBuildCommand:
         provider = CodexProvider("test1234", "test-session", "window-0", "test_agent")
         command = provider._build_codex_command()
 
-        # Existing env_vars preserved and CAO_TERMINAL_ID appended
+        # Existing env_vars preserved and CAO_TERMINAL_ID / CAO_AGENT_DEPTH appended
         assert "HOME" in command
         assert "PATH" in command
         assert "CAO_TERMINAL_ID" in command
+        assert "CAO_AGENT_DEPTH" in command
 
     @patch("cli_agent_orchestrator.providers.codex.load_agent_profile")
     def test_build_command_empty_system_prompt(self, mock_load_profile):

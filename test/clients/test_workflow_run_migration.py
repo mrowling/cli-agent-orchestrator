@@ -84,6 +84,7 @@ def test_workflow_run_step_columns(patched_db):
         "error",
         "updated_at",
         "call_fingerprint",
+        "started_at",
     }
     # Composite PRIMARY KEY (run_id, step_id): both carry pk>0.
     assert cols["run_id"][5] > 0
@@ -94,6 +95,62 @@ def test_workflow_run_step_columns(patched_db):
     # U3 additive column (E2): defaults to NULL (INV-2). PRAGMA table_info reports
     # the literal default expression as the string "NULL", not Python None.
     assert cols["call_fingerprint"][4] == "NULL"
+    # D1 additive column: started_at defaults to NULL for pre-D1 / never-run steps.
+    assert cols["started_at"][4] == "NULL"
+
+
+def test_workflow_run_step_started_at_additive_migration(patched_db):
+    """D1: an older-schema DB without started_at migrates and preserves NULL on old rows."""
+    # Simulate a pre-D1 schema (call_fingerprint present, started_at absent).
+    with sqlite3.connect(str(patched_db)) as conn:
+        conn.execute(
+            "CREATE TABLE workflow_run_step ("
+            "run_id TEXT NOT NULL, "
+            "step_id TEXT NOT NULL, "
+            "state TEXT NOT NULL, "
+            "attempts INTEGER NOT NULL, "
+            "output_json TEXT, "
+            "error TEXT, "
+            "updated_at TEXT NOT NULL, "
+            "call_fingerprint TEXT DEFAULT NULL, "
+            "PRIMARY KEY (run_id, step_id)"
+            ")"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run_step "
+            "(run_id, step_id, state, attempts, output_json, error, updated_at) "
+            "VALUES ('r-old', 's1', 'completed', 1, NULL, NULL, '2026-01-01T00:00:05Z')"
+        )
+        conn.commit()
+
+    _migrate_workflow_run_step()
+
+    cols = _columns(patched_db, "workflow_run_step")
+    assert "started_at" in cols
+
+    with sqlite3.connect(str(patched_db)) as conn:
+        row = conn.execute(
+            "SELECT started_at FROM workflow_run_step WHERE run_id = ? AND step_id = ?",
+            ("r-old", "s1"),
+        ).fetchone()
+    assert row is not None
+    assert row[0] is None
+
+    # A new RUNNING transition sets started_at via the journal write path.
+    from cli_agent_orchestrator.services import workflow_journal
+
+    workflow_journal.insert_steps("r-old", [("s2", "pending")], "2026-01-01T00:00:00Z")
+    workflow_journal.update_step(
+        "r-old",
+        "s2",
+        "running",
+        0,
+        "2026-01-01T00:00:01Z",
+        started_at="2026-01-01T00:00:01Z",
+    )
+    row = workflow_journal.get_step("r-old", "s2")
+    assert row is not None
+    assert row.started_at == "2026-01-01T00:00:01Z"
 
 
 def test_migrations_are_idempotent(patched_db):

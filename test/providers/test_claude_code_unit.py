@@ -1439,6 +1439,8 @@ class TestClaudeCodeProviderMisc:
         mcp_data = _extract_mcp_config(command)
         server_env = mcp_data["mcpServers"]["cao-mcp-server"]["env"]
         assert server_env["CAO_TERMINAL_ID"] == "term-42"
+        # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
+        assert server_env["CAO_AGENT_DEPTH"] == "0"
 
     @patch("cli_agent_orchestrator.providers.claude_code.load_agent_profile")
     def test_build_command_resolves_bundled_mcp_command(self, mock_load):

@@ -88,19 +88,18 @@ def _get_role_defaults(role: str) -> List[str] | None:
     if role in ROLE_TOOL_DEFAULTS:
         return list(ROLE_TOOL_DEFAULTS[role])
 
-    # Check custom roles from settings.json
-    from cli_agent_orchestrator.services.settings_service import _load
+    # Check custom roles from settings.json (agents.roles setter / nested schema)
+    from cli_agent_orchestrator.services.settings_service import get_agent_roles
 
-    settings = _load()
-    # Nested format: {"agents": {"roles": {...}}}
-    nested = settings.get("agents", {})
-    if isinstance(nested, dict) and "roles" in nested and isinstance(nested["roles"], dict):
-        custom_roles = nested["roles"]
-    else:
-        # Legacy flat format: {"roles": {...}}
-        custom_roles = settings.get("roles", {})
+    custom_roles = get_agent_roles()
     if role in custom_roles:
-        return list(custom_roles[role])
+        tools = custom_roles[role]
+        if not isinstance(tools, list):
+            raise ValueError(
+                f"Custom role '{role}' must map to a list of allowedTools; "
+                f"got {type(tools).__name__}. Fix agents.roles in settings.json."
+            )
+        return list(tools)
 
     return None
 
@@ -115,7 +114,10 @@ def resolve_allowed_tools(
     Resolution order:
     1. profile_allowed_tools (explicit in profile or --allowed-tools CLI)
     2. Role-based defaults (built-in or custom from settings.json)
-    3. Unrestricted ["*"] (backward compatible — no role/allowedTools = no restrictions)
+    3. No role + no allowedTools → developer defaults
+
+    D9: an unrecognized role fails closed (raises ValueError) instead of
+    resolving to unrestricted ``["*"]``.
 
     MCP server names from the profile are appended as @server_name.
     """
@@ -126,12 +128,15 @@ def resolve_allowed_tools(
         if role_defaults is not None:
             allowed = role_defaults
         else:
-            logger.warning(
-                "Unknown role '%s' — falling back to unrestricted. "
-                "Define custom roles in settings.json under 'roles'.",
-                role,
+            # D9: fail closed — never grant ["*"] for an unknown role.
+            raise ValueError(
+                f"Unknown role '{role}': not a built-in role and not defined in "
+                f"settings.json agents.roles. Register the role via "
+                f"`cao config set agents.roles.{role} '[...]'` (or "
+                f"settings_service.set_agent_roles), or set allowedTools "
+                f"explicitly on the profile. Unknown roles no longer resolve "
+                f"to unrestricted access."
             )
-            allowed = ["*"]
     else:
         # No role, no allowedTools — default to developer (secure default)
         from cli_agent_orchestrator.constants import ROLE_TOOL_DEFAULTS

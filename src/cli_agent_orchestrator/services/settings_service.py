@@ -597,6 +597,57 @@ def set_extra_agent_dirs(dirs: List[str]) -> List[str]:
     return extra_agent_dirs
 
 
+def get_agent_roles() -> Dict[str, List[str]]:
+    """Get custom role → allowedTools bundles.
+
+    Reads from the nested schema first (``agents.roles``), falls back to the
+    legacy flat key (``roles``) for backward compatibility. Built-in roles
+    live in ``ROLE_TOOL_DEFAULTS`` and are not returned here.
+    """
+    settings = _load()
+    nested = settings.get("agents", {})
+    if isinstance(nested, dict) and isinstance(nested.get("roles"), dict):
+        raw = nested["roles"]
+    else:
+        raw = settings.get("roles", {})
+    if not isinstance(raw, dict):
+        return {}
+    result: Dict[str, List[str]] = {}
+    for name, tools in raw.items():
+        if isinstance(name, str) and isinstance(tools, list):
+            result[name] = [t for t in tools if isinstance(t, str)]
+    return result
+
+
+def set_agent_roles(roles: Dict[str, List[str]]) -> Dict[str, List[str]]:
+    """Replace custom role → allowedTools bundles (D9).
+
+    Writes to the nested schema (``agents.roles``) and the legacy flat key
+    (``roles``) for backward compatibility — mirroring ``set_agent_dirs``.
+    Each value must be a list of CAO tool vocabulary strings. An empty dict
+    clears all custom roles.
+    """
+    cleaned: Dict[str, List[str]] = {}
+    for name, tools in roles.items():
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError("role names must be non-empty strings")
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools):
+            raise ValueError(f"role '{name}' must map to a list of allowedTools strings")
+        cleaned[name.strip()] = list(tools)
+
+    settings = _load()
+    agents_section = settings.get("agents", {})
+    if not isinstance(agents_section, dict):
+        agents_section = {}
+    agents_section["roles"] = cleaned
+    settings["agents"] = agents_section
+    # Legacy flat key for older readers / hand-edited settings
+    settings["roles"] = cleaned
+    _save(settings)
+    logger.info("Updated agent roles: %s", sorted(cleaned.keys()))
+    return get_agent_roles()
+
+
 def get_extra_skill_dirs() -> List[str]:
     """Get extra skill scan directories (user-added custom paths).
 

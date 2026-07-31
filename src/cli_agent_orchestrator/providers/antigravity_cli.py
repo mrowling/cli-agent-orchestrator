@@ -41,6 +41,7 @@ counter, since the TUI looks identical in both states).
 
 import json
 import logging
+import os
 import re
 import shlex
 import shutil
@@ -332,8 +333,9 @@ class AntigravityCliProvider(BaseProvider):
 
         agy reads MCP servers from this fixed file under the top-level
         ``mcpServers`` key. We merge our entries in (preserving any existing,
-        non-CAO servers), forwarding ``CAO_TERMINAL_ID`` into each server's env
-        so cao-mcp-server can resolve the current terminal for handoff / assign.
+        non-CAO servers), forwarding ``CAO_TERMINAL_ID`` and ``CAO_AGENT_DEPTH``
+        (D6) into each server's env so cao-mcp-server can resolve the current
+        terminal for handoff / assign and gate spawn depth.
 
         Concurrency: the file is shared across terminals, but CAO serializes
         launches (initialize() waits for the agent to become ready before the
@@ -389,6 +391,8 @@ class AntigravityCliProvider(BaseProvider):
             }
             env = dict(cfg.get("env", {}))
             env["CAO_TERMINAL_ID"] = self.terminal_id
+            # D6: forward spawn depth into MCP subprocess (agy does not inherit pane env).
+            env["CAO_AGENT_DEPTH"] = os.environ.get("CAO_AGENT_DEPTH", "0")
             entry["env"] = env
             servers[server_name] = entry
             self._mcp_server_names.append(server_name)
