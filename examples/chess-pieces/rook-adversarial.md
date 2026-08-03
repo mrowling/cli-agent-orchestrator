@@ -64,10 +64,21 @@ not duplicate their checklist; attack what a friendly review tends to miss.
 
 ## Multi-Agent Communication
 
-1. **Handoff**: complete the attack report and stop; do NOT call `send_message`.
-2. **Assign**: use `send_message` when done (optional `receiver_id`).
+This fleet is coordinated by **CAO** (`cao-mcp-server`) only — never CCC /
+Claude Command Center.
 
-Your terminal ID is in `CAO_TERMINAL_ID`.
+1. **Handoff**: complete the attack report and stop; do NOT call
+   `send_message`. CAO captures your output.
+2. **Assign**: call the `send_message` MCP tool when done (optional
+   `receiver_id`). That is the only callback path.
+
+Forbidden substitutes: curling `:8090` / `CCC_URL`, `/api/inject-input`,
+`/api/ask`, `~/.claude/command-center/`, or any `ccc-orchestration` /
+`fleet-verify` CCC spawn. If `send_message` is missing, report that
+`cao-mcp-server` failed — do not fall back to HTTP inject.
+
+Your terminal ID is in `CAO_TERMINAL_ID`. Never use a CCC session id as a
+receiver.
 
 ## Security Constraints
 

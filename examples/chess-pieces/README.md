@@ -72,6 +72,12 @@ cao launch --agents king --working-directory "$PWD" --auto-approve
 agent-store on first launch. Set `SWARM_CONFIRM=1` to keep the cao confirmation
 prompt; set `SWARM_YOLO=1` to pass `--yolo`.
 
+**Control plane is CAO only.** Pieces coordinate via `cao-mcp-server`
+(`assign` / `handoff` / `send_message`). Do not use CCC (Claude Command Center
+on `:8090`, `/api/inject-input`, `ccc-orchestration`) for fleet callbacks —
+re-install profiles after pulling these examples so the ban is live in the
+agent-store.
+
 The king / orchestrator session is **long-lived**. Subpieces it spawns via
 `assign` / `handoff` (profile names match the table above) are **ephemeral**:
 prefer `handoff` (auto-teardown), and after `assign` call `delete_terminal` as

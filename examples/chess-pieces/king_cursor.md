@@ -43,6 +43,11 @@ Do NOT substitute a provider built-in Agent/Task/subagent tool for `assign` or
 `handoff`. If those tools are missing, stop and report that `cao-mcp-server`
 failed to start.
 
+Do NOT use CCC (Claude Command Center) for fleet coordination — no curl to
+`:8090` / `CCC_URL`, no `/api/inject-input` or `/api/ask`, no
+`ccc-orchestration` skill. Workers report via CAO `send_message` (assign) or
+handoff capture; you must not instruct them to inject via CCC.
+
 After `assign()`, finish your turn so results can be delivered when you go idle.
 Do not `sleep`/poll to wait — that blocks inbox delivery.
 
