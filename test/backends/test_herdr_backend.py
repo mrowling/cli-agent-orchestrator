@@ -18,9 +18,8 @@ from cli_agent_orchestrator.backends.herdr_backend import HerdrBackend
 
 @pytest.fixture
 def backend():
-    # Patch os.path.exists so _ensure_session_running finds the socket immediately,
-    # avoiding the 5-second poll timeout in unit tests.
-    with patch("cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True):
+    # Live-socket check would otherwise try a real Unix connect / 15s poll.
+    with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
         yield HerdrBackend(send_delay_ms=0)
 
 
@@ -664,9 +663,7 @@ class TestMultiPaneResolution:
 
     @pytest.fixture
     def backend(self):
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             yield HerdrBackend(send_delay_ms=0)
 
     @patch("subprocess.run")
@@ -931,27 +928,21 @@ class TestSessionSocketPath:
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_named_session_uses_subdir(self):
         """Named session should produce <config_home>/herdr/<name>/herdr.sock."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             b = HerdrBackend(herdr_session="cao")
         assert b._session_socket_path() == "/custom/config/herdr/sessions/cao/herdr.sock"
 
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_default_session_uses_flat_path(self):
         """'default' session should produce <config_home>/herdr/herdr.sock (no subdir)."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             b = HerdrBackend(herdr_session="default")
         assert b._session_socket_path() == "/custom/config/herdr/herdr.sock"
 
     @patch.dict("os.environ", {"XDG_CONFIG_HOME": "/custom/config"})
     def test_arbitrary_session_name(self):
         """An arbitrary session name should appear as a subdirectory."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             b = HerdrBackend(herdr_session="my-workspace")
         assert b._session_socket_path() == "/custom/config/herdr/sessions/my-workspace/herdr.sock"
 
@@ -962,59 +953,78 @@ class TestSessionSocketPath:
 class TestEnsureSessionRunning:
     """Test _ensure_session_running startup logic."""
 
-    def test_does_nothing_when_socket_exists(self):
-        """If socket already exists, no Popen should be called."""
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists", return_value=True
-        ):
+    def test_does_nothing_when_socket_is_live(self):
+        """If socket accepts connections, no Popen should be called."""
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=True):
             with patch("subprocess.Popen") as mock_popen:
                 HerdrBackend(herdr_session="cao")
         mock_popen.assert_not_called()
 
     def test_starts_server_when_socket_absent(self):
         """If socket is absent, Popen should be called with herdr server args."""
-        # Socket absent initially, then appears after first poll.
-        exists_sequence = [False, True]
+        # Dead initially, then live after first poll.
+        live_sequence = [False, True]
 
-        def exists_side_effect(path):
-            return exists_sequence.pop(0) if exists_sequence else True
+        def live_side_effect(self, path):
+            return live_sequence.pop(0) if live_sequence else True
 
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            side_effect=exists_side_effect,
-        ):
-            with patch("subprocess.Popen") as mock_popen:
-                with patch("time.sleep"):
-                    HerdrBackend(herdr_session="cao")
+        with patch.object(HerdrBackend, "_socket_is_live", live_side_effect):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ):
+                with patch("subprocess.Popen") as mock_popen:
+                    with patch("time.sleep"):
+                        HerdrBackend(herdr_session="cao")
 
         mock_popen.assert_called_once()
         cmd = mock_popen.call_args[0][0]
         assert cmd == ["herdr", "--session", "cao", "server"]
 
+    def test_removes_stale_socket_and_restarts(self):
+        """Dead leftover sock file must be unlinked before starting the server."""
+        live_sequence = [False, True]
+
+        def live_side_effect(self, path):
+            return live_sequence.pop(0) if live_sequence else True
+
+        with patch.object(HerdrBackend, "_socket_is_live", live_side_effect):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=True,
+            ):
+                with patch(
+                    "cli_agent_orchestrator.backends.herdr_backend.os.unlink"
+                ) as mock_unlink:
+                    with patch("subprocess.Popen") as mock_popen:
+                        with patch("time.sleep"):
+                            HerdrBackend(herdr_session="cao")
+
+        mock_unlink.assert_called_once()
+        mock_popen.assert_called_once()
+        assert mock_popen.call_args[0][0] == ["herdr", "--session", "cao", "server"]
+
     def test_logs_warning_when_socket_never_appears(self):
-        """If socket never appears within 15s, a warning is logged and no error raised."""
-        # Simulate clock: first call returns 0.0 (sets deadline=15.0),
-        # all subsequent calls return 16.0 (past deadline, exits loop).
-        # Using a counter so exhaustion from logging internals is not an issue.
+        """If socket never becomes live within 15s, a warning is logged and no error raised."""
         call_count = {"n": 0}
 
         def fake_time():
             call_count["n"] += 1
             return 0.0 if call_count["n"] == 1 else 16.0
 
-        with patch(
-            "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
-            return_value=False,
-        ):
-            with patch("subprocess.Popen"):
-                with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"):
-                    with patch(
-                        "cli_agent_orchestrator.backends.herdr_backend.time.time",
-                        side_effect=fake_time,
-                    ):
-                        # Should not raise
-                        HerdrBackend(herdr_session="cao")
-
+        with patch.object(HerdrBackend, "_socket_is_live", return_value=False):
+            with patch(
+                "cli_agent_orchestrator.backends.herdr_backend.os.path.exists",
+                return_value=False,
+            ):
+                with patch("subprocess.Popen"):
+                    with patch("cli_agent_orchestrator.backends.herdr_backend.time.sleep"):
+                        with patch(
+                            "cli_agent_orchestrator.backends.herdr_backend.time.time",
+                            side_effect=fake_time,
+                        ):
+                            # Should not raise
+                            HerdrBackend(herdr_session="cao")
 
 # --- create_window window_shell ---
 

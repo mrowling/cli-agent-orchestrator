@@ -146,10 +146,23 @@ herdr --session cao workspace list          # named session
 
 ### Socket connection errors in CAO logs
 
-herdr must be running before the CAO server starts. If you see socket errors:
+herdr must be reachable on its session socket. If you see
+`Connection refused` on `herdr.sock`:
 
 1. Confirm herdr is running: `herdr --session cao workspace list`
-2. If not running, start it: `herdr --session cao`
-3. Restart the CAO server: `cao-server`
+2. If not running, start it: `herdr --session cao` (or
+   `herdr --session cao server` headless)
+3. If the socket file exists but every command still says Connection
+   refused, it is a **stale socket** left after a crash — remove it and
+   restart:
+   ```bash
+   rm -f ~/.config/herdr/sessions/cao/herdr.sock \
+         ~/.config/herdr/sessions/cao/herdr-client.sock
+   herdr --session cao server
+   ```
+   CAO also detects this case and auto-restarts herdr on the next
+   operation (after this fix).
+4. Restart the CAO server if the inbox service was already wedged:
+   `cao-server`
 
 The default socket path is derived from the session name. If you use a non-default `herdr_session`, ensure herdr was started with the matching `--session` flag.

@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import re
+import socket
 import subprocess
 import time
 from pathlib import Path
@@ -202,6 +203,9 @@ class HerdrBackend(TerminalBackend):
             TerminalBackendError: If check=True and command fails, or if args
                 contain unsafe characters or unknown subcommands.
         """
+        # Recover from mid-lifecycle herdr death (stale sock left behind).
+        # Cheap when live; starts the server only when the socket is dead.
+        self._ensure_session_running()
         try:
             sanitized = _sanitize_herdr_args(args)
         except ValueError as e:
@@ -809,22 +813,52 @@ class HerdrBackend(TerminalBackend):
             return f"{config_home}/herdr/herdr.sock"
         return f"{config_home}/herdr/sessions/{self._herdr_session}/herdr.sock"
 
-    def _ensure_session_running(self) -> None:
-        """Start the herdr session server if its socket does not exist.
+    def _socket_is_live(self, socket_path: str) -> bool:
+        """Return True if ``socket_path`` accepts a Unix-domain connection.
 
-        Checks for the session socket file. If absent, starts the server
-        headlessly and waits up to 5 seconds for the socket to appear.
-        Logs a warning if the socket never appears but does not raise —
-        the first actual herdr operation will produce a clear error.
+        A leftover ``herdr.sock`` file after a crash/kill still passes
+        ``os.path.exists`` but refuses connects (errno 61). Treating that as
+        "running" skips auto-start and every later CLI call fails with
+        Connection refused.
+        """
+        if not os.path.exists(socket_path):
+            return False
+        try:
+            with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as sock:
+                sock.settimeout(0.5)
+                sock.connect(socket_path)
+            return True
+        except OSError:
+            return False
+
+    def _ensure_session_running(self) -> None:
+        """Start the herdr session server if its socket is missing or stale.
+
+        Checks that the session socket accepts connections. If the path is
+        absent or is a dead leftover file, starts the server headlessly and
+        waits up to 15 seconds for a live socket. Logs a warning if the
+        socket never becomes reachable but does not raise — the first actual
+        herdr operation will produce a clear error.
         """
         socket_path = self._session_socket_path()
-        if os.path.exists(socket_path):
+        if self._socket_is_live(socket_path):
             return
 
-        logger.info(
-            f"Herdr session '{self._herdr_session}' not running "
-            f"(socket {socket_path} absent) — starting server."
-        )
+        if os.path.exists(socket_path):
+            logger.warning(
+                f"Herdr session '{self._herdr_session}' socket at {socket_path} "
+                "exists but refuses connections (stale) — removing and restarting."
+            )
+            try:
+                os.unlink(socket_path)
+            except OSError as e:
+                logger.warning(f"Failed to remove stale herdr socket {socket_path}: {e}")
+        else:
+            logger.info(
+                f"Herdr session '{self._herdr_session}' not running "
+                f"(socket {socket_path} absent) — starting server."
+            )
+
         subprocess.Popen(
             ["herdr", "--session", self._herdr_session, "server"],
             stdout=subprocess.DEVNULL,
@@ -835,17 +869,18 @@ class HerdrBackend(TerminalBackend):
         # Give herdr a moment to create the socket file before polling.
         time.sleep(0.5)
 
-        # Poll up to 15 seconds for the socket to appear.
+        # Poll up to 15 seconds for a live socket (not just the path).
         deadline = time.time() + 15.0
         while time.time() < deadline:
-            if os.path.exists(socket_path):
+            if self._socket_is_live(socket_path):
                 logger.info(f"Herdr session '{self._herdr_session}' is ready.")
                 return
             time.sleep(0.1)
 
         logger.warning(
-            f"Herdr session '{self._herdr_session}' socket did not appear within 15s "
-            f"at {socket_path}. The first herdr operation will fail with a clear error."
+            f"Herdr session '{self._herdr_session}' socket did not become reachable "
+            f"within 15s at {socket_path}. The first herdr operation will fail "
+            "with a clear error."
         )
 
     def _parse_new_pane_id(self, stdout: str) -> Optional[str]:
