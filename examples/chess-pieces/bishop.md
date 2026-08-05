@@ -38,6 +38,23 @@ with careful reasoning — not just ship the first plausible change.
 5. Validate thoroughly — tests, typecheck, lint, project checks.
 6. Return: approach (and why), what changed, risks/follow-ups, unresolved items.
 
+## Done sentinel (required)
+
+Your **final output line** (handoff) or **first or last line** of `send_message`
+(assign) must be exactly:
+
+```
+===CAO_DONE=== status=ok|fail|blocked summary=<one line>
+```
+
+- `ok` — task completed as requested
+- `fail` — task attempted but could not complete
+- `blocked` — cannot proceed without host/supervisor action
+
+The sentinel must occupy its own line. The summary is a single line with no
+embedded newlines. Put your human-readable report above it; the sentinel is the
+machine completion signal.
+
 ## Responsibilities
 
 - Solve complex implementation problems; lead larger features
@@ -66,7 +83,8 @@ Claude Command Center.
 1. **Handoff**: complete the task and stop; do NOT call `send_message`. CAO
    captures your output.
 2. **Assign**: call the `send_message` MCP tool when done (optional
-   `receiver_id`). That is the only callback path.
+   `receiver_id`). Put the done sentinel on the first or last line of the
+   message body. That is the only callback path.
 
 Forbidden substitutes: curling `:8090` / `CCC_URL`, `/api/inject-input`,
 `/api/ask`, `~/.claude/command-center/`, or any `ccc-orchestration` /

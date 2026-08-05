@@ -41,6 +41,23 @@ convenience.
 6. Return: decision/approach (and why), alternatives, what changed, risks, what
    to delegate next.
 
+## Done sentinel (required)
+
+Your **final output line** (handoff) or **first or last line** of `send_message`
+(assign) must be exactly:
+
+```
+===CAO_DONE=== status=ok|fail|blocked summary=<one line>
+```
+
+- `ok` — task completed as requested
+- `fail` — task attempted but could not complete
+- `blocked` — cannot proceed without host/supervisor action
+
+The sentinel must occupy its own line. The summary is a single line with no
+embedded newlines. Put your human-readable report above it; the sentinel is the
+machine completion signal.
+
 ## Responsibilities
 
 - Own system architecture; design cross-system solutions
@@ -79,7 +96,8 @@ Claude Command Center.
 1. **Handoff**: message starts with `[CAO Handoff]` — complete the task and stop;
    do NOT call `send_message`. CAO captures your output.
 2. **Assign**: callback terminal ID present — call the `send_message` MCP tool
-   when done. Without `receiver_id`, it routes to the assigning terminal.
+   when done. Put the done sentinel on the first or last line of the message
+   body. Without `receiver_id`, it routes to the assigning terminal.
 
 Forbidden substitutes: curling `:8090` / `CCC_URL`, `/api/inject-input`,
 `/api/ask`, `~/.claude/command-center/`, or any `ccc-orchestration` /

@@ -5,6 +5,7 @@
 # with --working-directory=$PWD. Also manages cao-server + Web UI.
 #
 # Usage:
+#   swarm init                 # bd + .swarm/ policy files in $PWD
 #   swarm start                # start cao-server in the background
 #   swarm stop                 # stop cao-server (optional: --sessions)
 #   swarm ui                   # open the Web UI in a browser
@@ -44,7 +45,8 @@ API_BASE="http://${API_HOST}:${API_PORT}"
 
 usage() {
   cat <<EOF
-Usage: swarm start [--fg]          # start cao-server in background (or --fg)
+Usage: swarm init                 # bd + .swarm/ policy files in \$PWD
+       swarm start [--fg]          # start cao-server in background (or --fg)
        swarm stop [--sessions]     # stop cao-server (also cao shutdown --all)
        swarm ui                    # open Web UI (\$CAO_API_HOST:\$CAO_API_PORT)
        swarm status                # health / pid / urls
@@ -55,6 +57,11 @@ Usage: swarm start [--fg]          # start cao-server in background (or --fg)
        swarm orchestrator [slug] […]
        swarm orchestrator_cursor|orchestrator_oc [slug] […]
        swarm -h|--help
+
+Workspace:
+  init                         require bd on PATH; run bd init if .beads/ missing;
+                               create missing .swarm/{POLICY,LEARNINGS,state}.json
+                               from templates (never task-log.md); preserve existing
 
 Server:
   start                        start cao-server in background; wait for /health
@@ -94,6 +101,44 @@ need_cmd() {
     echo "error: required command not found: $1" >&2
     exit 1
   fi
+}
+
+SWARM_TEMPLATES_DIR="${CAO_SWARM_ROOT}/swarm-templates"
+
+cmd_init() {
+  if ! command -v bd >/dev/null 2>&1; then
+    echo "error: bd (beads) not found on PATH" >&2
+    echo "hint: install bd (e.g. brew install beads) and ensure it is on PATH" >&2
+    echo "hint: then re-run: swarm init" >&2
+    exit 1
+  fi
+
+  if [[ ! -d ".beads" ]]; then
+    echo "swarm: running bd init in $PWD" >&2
+    bd init
+  else
+    echo "swarm: .beads/ already present — skipping bd init" >&2
+  fi
+
+  mkdir -p ".swarm"
+
+  local name dest src
+  for name in POLICY.md LEARNINGS.md state.json; do
+    dest=".swarm/$name"
+    src="${SWARM_TEMPLATES_DIR}/$name"
+    if [[ -f "$dest" ]]; then
+      echo "swarm: preserving existing $dest" >&2
+      continue
+    fi
+    if [[ ! -f "$src" ]]; then
+      echo "error: missing swarm template: $src" >&2
+      exit 1
+    fi
+    cp "$src" "$dest"
+    echo "swarm: created $dest from template" >&2
+  done
+
+  echo "swarm: init complete in $PWD" >&2
 }
 
 resolve_cao_server() {
@@ -182,8 +227,7 @@ cmd_start() {
   local pid=$!
   printf '%s\n' "$pid" >"$PID_FILE"
 
-  local i
-  for i in $(seq 1 60); do
+  for _ in $(seq 1 60); do
     if server_healthy; then
       echo "swarm: cao-server healthy (pid $pid)" >&2
       echo "swarm: web ui → ${API_BASE}/" >&2
@@ -228,8 +272,7 @@ cmd_stop() {
   if pid_alive "$pid"; then
     echo "swarm: stopping cao-server pid=$pid" >&2
     kill "$pid" 2>/dev/null || true
-    local i
-    for i in $(seq 1 40); do
+    for _ in $(seq 1 40); do
       pid_alive "$pid" || break
       sleep 0.1
     done
@@ -476,6 +519,14 @@ launch_piece() {
 PIECE="${1:-}"
 case "$PIECE" in
   -h|--help) usage 0 ;;
+  init)
+    shift || true
+    if [[ $# -gt 0 ]]; then
+      echo "error: swarm init takes no arguments (operates on \$PWD)" >&2
+      usage 1
+    fi
+    cmd_init
+    ;;
   start|up)
     shift || true
     cmd_start "$@"

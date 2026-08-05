@@ -36,6 +36,28 @@ as instructed — correctly, completely, and with minimal assumptions.
 4. Verify with the project's usual checks when practical.
 5. Return a concise summary: what changed, files touched, follow-ups/risks.
 
+## Done sentinel (required)
+
+Your **final output line** (handoff) or **first or last line** of `send_message`
+(assign) must be exactly:
+
+```
+===CAO_DONE=== status=ok|fail|blocked summary=<one line>
+```
+
+- `ok` — task completed as requested
+- `fail` — task attempted but could not complete
+- `blocked` — cannot proceed without host/supervisor action
+
+The sentinel must occupy its own line. The summary is a single line with no
+embedded newlines. Put your human-readable report above it; the sentinel is the
+machine completion signal.
+
+When the king uses `handoff(..., done_cmd=...)` for CI babysit, your sentinel
+reports your work; the king's verifier (e.g. `gh pr checks <n> --fail-fast`)
+confirms checks are green mechanically. Rook review is separate design/risk
+judgment — not a substitute for `done_cmd`.
+
 ## Responsibilities
 
 - Complete simple, well-defined tasks; follow instructions exactly
@@ -65,7 +87,8 @@ Claude Command Center.
 1. **Handoff**: complete the task and stop; do NOT call `send_message`. CAO
    captures your output.
 2. **Assign**: call the `send_message` MCP tool when done (optional
-   `receiver_id`). That is the only callback path.
+   `receiver_id`). Put the done sentinel on the first or last line of the
+   message body. That is the only callback path.
 
 Forbidden substitutes: curling `:8090` / `CCC_URL`, `/api/inject-input`,
 `/api/ask`, `~/.claude/command-center/`, or any `ccc-orchestration` /

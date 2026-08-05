@@ -111,6 +111,9 @@ provider override while keeping the same sequence.
   outcomes into lessons and promoted instructions.
 - [Tool restrictions](docs/tool-restrictions.md): roles, allowlists, and
   provider enforcement.
+- [Working directory](docs/working-directory.md) and
+  [workspace backends](docs/workspace-backends.md): cwd parameter vs
+  per-worker isolation (`shared` / `worktree` / `auto`; D11).
 - [Updating CAO](docs/updating.md): update an installed uv tool.
 
 ### Configure and integrate

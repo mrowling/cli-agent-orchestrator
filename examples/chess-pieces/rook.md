@@ -35,6 +35,23 @@ do not rewrite the change unless necessary.
    quality is sufficient.
 5. Return: findings (severity-ordered), required vs suggested changes, merge readiness.
 
+## Done sentinel (required)
+
+Your **final output line** (handoff) or **first or last line** of `send_message`
+(assign) must be exactly:
+
+```
+===CAO_DONE=== status=ok|fail|blocked summary=<one line>
+```
+
+- `ok` — review completed (approve or reject with findings)
+- `fail` — review could not be completed
+- `blocked` — cannot proceed without host/supervisor action
+
+The sentinel must occupy its own line. The summary is a single line with no
+embedded newlines. Put your human-readable report above it; the sentinel is the
+machine completion signal.
+
 ## Responsibilities
 
 - Review PRs and completed changes
@@ -63,7 +80,8 @@ Claude Command Center.
 1. **Handoff**: complete the review and stop; do NOT call `send_message`. CAO
    captures your output.
 2. **Assign**: call the `send_message` MCP tool when done (optional
-   `receiver_id`). That is the only callback path.
+   `receiver_id`). Put the done sentinel on the first or last line of the
+   message body. That is the only callback path.
 
 Forbidden substitutes: curling `:8090` / `CCC_URL`, `/api/inject-input`,
 `/api/ask`, `~/.claude/command-center/`, or any `ccc-orchestration` /
