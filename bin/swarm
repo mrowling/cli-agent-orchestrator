@@ -373,12 +373,12 @@ model_for() {
   local piece="$1" model
   model="$(field_for "$piece" model)"
   case "$piece" in
-    king|orchestrator|queen) model="${model:-claude-opus-5}" ;;
+    king|orchestrator|queen) model="${model:-claude-opus-4.8-thinking-high}" ;;
     king_cursor|orchestrator_cursor|queen_cursor)
-      model="${model:-claude-opus-5-thinking-high}"
+      model="${model:-claude-opus-4.8-thinking-high}"
       ;;
     king_oc|orchestrator_oc|queen_oc)
-      model="${model:-anthropic/claude-opus-5}"
+      model="${model:-anthropic/claude-opus-4.8-thinking-high}"
       ;;
     *) [[ -z "$model" || "$model" == "inherit" ]] && model="auto" ;;
   esac
@@ -388,14 +388,14 @@ model_for() {
 blurb_for() {
   case "$1" in
     king) echo "scoped fleet supervisor for this directory" ;;
-    king_cursor) echo "king on Cursor (Opus 5 thinking)" ;;
-    king_oc) echo "king on OpenCode (Opus 5)" ;;
+    king_cursor) echo "king on Cursor (Opus 4.8 high)" ;;
+    king_oc) echo "king on OpenCode (Opus 4.8 high)" ;;
     orchestrator) echo "pure decompose + delegate via assign/handoff" ;;
-    orchestrator_cursor) echo "orchestrator on Cursor (Opus 5 thinking)" ;;
-    orchestrator_oc) echo "orchestrator on OpenCode (Opus 5)" ;;
+    orchestrator_cursor) echo "orchestrator on Cursor (Opus 4.8 high)" ;;
+    orchestrator_oc) echo "orchestrator on OpenCode (Opus 4.8 high)" ;;
     queen) echo "architecture / major trade-offs (Claude Code)" ;;
-    queen_cursor) echo "queen on Cursor (Opus 5 thinking)" ;;
-    queen_oc) echo "queen on OpenCode (Opus 5)" ;;
+    queen_cursor) echo "queen on Cursor (Opus 4.8 high)" ;;
+    queen_oc) echo "queen on OpenCode (Opus 4.8 high)" ;;
     bishop) echo "complex / ambiguous implementation" ;;
     rook) echo "constructive code review" ;;
     rook-adversarial) echo "high-stakes red-team review" ;;

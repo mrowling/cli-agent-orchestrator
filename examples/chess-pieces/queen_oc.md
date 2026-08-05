@@ -7,7 +7,7 @@ description: >-
   practical.
 role: developer
 provider: opencode_cli
-model: anthropic/claude-opus-5
+model: anthropic/claude-opus-4.8-thinking-high
 tags:
   - architecture
   - design

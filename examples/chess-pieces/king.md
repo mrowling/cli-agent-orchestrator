@@ -6,7 +6,7 @@ description: >-
   for implementation, rook / rook-adversarial for review, queen for architecture.
 role: supervisor
 provider: claude_code
-model: claude-opus-5
+model: claude-opus-4.8-thinking-high
 tags:
   - orchestration
   - supervisor

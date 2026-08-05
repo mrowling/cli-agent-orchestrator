@@ -7,7 +7,7 @@ description: >-
   practical.
 role: developer
 provider: cursor_cli
-model: claude-opus-5-thinking-high
+model: claude-opus-4.8-thinking-high
 tags:
   - architecture
   - design

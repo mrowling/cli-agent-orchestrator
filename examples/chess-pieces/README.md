@@ -6,15 +6,15 @@ Orchestrator.
 
 | Profile | Rank | CAO role | Default provider | Model | Use for |
 | --- | --- | --- | --- | --- | --- |
-| `king` | ♚ | `supervisor` | `claude_code` | `claude-opus-5` | Plan, discover, delegate — never code or review |
-| `king_cursor` | ♚ | `supervisor` | `cursor_cli` | `claude-opus-5-thinking-high` | Same as `king`, on Cursor |
-| `king_oc` | ♚ | `supervisor` | `opencode_cli` | `anthropic/claude-opus-5` | Same as `king`, on OpenCode |
-| `orchestrator` | — | `supervisor` | `claude_code` | `claude-opus-5` | Aggressive decompose-and-delegate only |
-| `orchestrator_cursor` | — | `supervisor` | `cursor_cli` | `claude-opus-5-thinking-high` | Same as `orchestrator`, on Cursor |
-| `orchestrator_oc` | — | `supervisor` | `opencode_cli` | `anthropic/claude-opus-5` | Same as `orchestrator`, on OpenCode |
-| `queen` | ♛ | `developer` | `claude_code` | `claude-opus-5` | Architecture / hard trade-offs |
-| `queen_cursor` | ♛ | `developer` | `cursor_cli` | `claude-opus-5-thinking-high` | Same as `queen`, on Cursor |
-| `queen_oc` | ♛ | `developer` | `opencode_cli` | `anthropic/claude-opus-5` | Same as `queen`, on OpenCode |
+| `king` | ♚ | `supervisor` | `claude_code` | `claude-opus-4.8-thinking-high` | Plan, discover, delegate — never code or review |
+| `king_cursor` | ♚ | `supervisor` | `cursor_cli` | `claude-opus-4.8-thinking-high` | Same as `king`, on Cursor |
+| `king_oc` | ♚ | `supervisor` | `opencode_cli` | `anthropic/claude-opus-4.8-thinking-high` | Same as `king`, on OpenCode |
+| `orchestrator` | — | `supervisor` | `claude_code` | `claude-opus-4.8-thinking-high` | Aggressive decompose-and-delegate only |
+| `orchestrator_cursor` | — | `supervisor` | `cursor_cli` | `claude-opus-4.8-thinking-high` | Same as `orchestrator`, on Cursor |
+| `orchestrator_oc` | — | `supervisor` | `opencode_cli` | `anthropic/claude-opus-4.8-thinking-high` | Same as `orchestrator`, on OpenCode |
+| `queen` | ♛ | `developer` | `claude_code` | `claude-opus-4.8-thinking-high` | Architecture / hard trade-offs |
+| `queen_cursor` | ♛ | `developer` | `cursor_cli` | `claude-opus-4.8-thinking-high` | Same as `queen`, on Cursor |
+| `queen_oc` | ♛ | `developer` | `opencode_cli` | `anthropic/claude-opus-4.8-thinking-high` | Same as `queen`, on OpenCode |
 | `bishop` | ♝ | `developer` | `cursor_cli` | `cursor-grok-4.5-high` | Complex / ambiguous implementation |
 | `rook` | ♜ | `reviewer` | `cursor_cli` | `cursor-grok-4.5-high` | Constructive code review |
 | `rook-adversarial` | ♜ | `reviewer` | `cursor_cli` | `cursor-grok-4.5-high` | Red-team / break-the-change review |

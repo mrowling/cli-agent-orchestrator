@@ -7,7 +7,7 @@ description: >-
   practical.
 role: developer
 provider: claude_code
-model: claude-opus-5
+model: claude-opus-4.8-thinking-high
 tags:
   - architecture
   - design

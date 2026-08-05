@@ -6,7 +6,7 @@ description: >-
   editing files when a worker can do it.
 role: supervisor
 provider: opencode_cli
-model: anthropic/claude-opus-5
+model: anthropic/claude-opus-4.8-thinking-high
 tags:
   - orchestration
   - supervisor

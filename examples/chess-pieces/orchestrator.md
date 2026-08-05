@@ -6,7 +6,7 @@ description: >-
   when a worker can do it.
 role: supervisor
 provider: claude_code
-model: claude-opus-5
+model: claude-opus-4.8-thinking-high
 tags:
   - orchestration
   - supervisor
