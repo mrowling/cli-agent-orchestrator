@@ -41,6 +41,9 @@ class TerminalModel(Base):
     allowed_tools = Column(String, nullable=True)  # JSON-encoded list of CAO tool names
     shell_command = Column(String, nullable=True)  # shell process name captured before kiro launch
     caller_id = Column(String, nullable=True)  # terminal that created this one (callback target)
+    # D11: JSON-encoded WorkspaceInfo (backend/path/branch/base_ref/…). Nullable
+    # so pre-migration rows and shared-default terminals stay compatible.
+    workspace_json = Column(Text, nullable=True)
     last_active = Column(DateTime, default=datetime.now)
 
 
@@ -574,6 +577,10 @@ def _migrate_terminals_schema() -> None:
             conn.execute("ALTER TABLE terminals ADD COLUMN caller_id TEXT")
             conn.commit()
             logger.info("Migration: added caller_id column to terminals table")
+        if "workspace_json" not in columns:
+            conn.execute("ALTER TABLE terminals ADD COLUMN workspace_json TEXT")
+            conn.commit()
+            logger.info("Migration: added workspace_json column to terminals table")
         conn.close()
     except Exception as e:
         logger.warning(f"Migration check for terminals schema failed: {e}")
@@ -588,6 +595,7 @@ def create_terminal(
     allowed_tools: Optional[List[str]] = None,
     shell_command: Optional[str] = None,
     caller_id: Optional[str] = None,
+    workspace_json: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Create terminal metadata record."""
     import json as _json
@@ -602,6 +610,7 @@ def create_terminal(
             allowed_tools=_json.dumps(allowed_tools) if allowed_tools else None,
             shell_command=shell_command,
             caller_id=caller_id,
+            workspace_json=workspace_json,
         )
         db.add(terminal)
         db.commit()
@@ -614,6 +623,7 @@ def create_terminal(
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "workspace_json": terminal.workspace_json,
         }
 
 
@@ -639,6 +649,7 @@ def get_terminal_metadata(terminal_id: str) -> Optional[Dict[str, Any]]:
             "allowed_tools": allowed_tools,
             "shell_command": terminal.shell_command,
             "caller_id": terminal.caller_id,
+            "workspace_json": getattr(terminal, "workspace_json", None),
             "last_active": terminal.last_active,
         }
 
@@ -694,6 +705,33 @@ def list_all_terminals() -> List[Dict[str, Any]]:
                 "provider": t.provider,
                 "agent_profile": t.agent_profile,
                 "last_active": t.last_active,
+            }
+            for t in terminals
+        ]
+
+
+def list_terminals_with_caller() -> List[Dict[str, Any]]:
+    """List terminals that have a recorded supervisor ``caller_id`` (wave reconcile).
+
+    Used at cao-server startup / first wave admit to rebuild conservative
+    in-flight assign-child reservations so a process restart cannot reset the
+    wave cap while live children remain. Queued-but-not-started requests are
+    process-local and are intentionally not restored.
+    """
+    with SessionLocal() as db:
+        terminals = (
+            db.query(TerminalModel)
+            .filter(TerminalModel.caller_id.isnot(None))
+            .filter(TerminalModel.caller_id != "")
+            .all()
+        )
+        return [
+            {
+                "id": t.id,
+                "caller_id": t.caller_id,
+                "tmux_session": t.tmux_session,
+                "provider": t.provider,
+                "agent_profile": t.agent_profile,
             }
             for t in terminals
         ]
@@ -1032,3 +1070,7 @@ def get_flows_to_run() -> List[Flow]:
             )
             for f in flows
         ]
+
+
+# Eager additive migration so SessionLocal users (incl. tests) see workspace_json.
+_migrate_terminals_schema()

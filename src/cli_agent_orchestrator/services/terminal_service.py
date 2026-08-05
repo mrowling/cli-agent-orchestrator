@@ -80,6 +80,7 @@ logger = logging.getLogger(__name__)
 _memory_injected_terminals: set = set()
 _memory_injected_lock = threading.Lock()
 
+
 # Strong references to in-flight deferred-init background tasks. asyncio keeps
 # only a WEAK reference to tasks from loop.create_task, so without this a
 # deferred provider.initialize() + input-send task could be GC'd mid-run,
@@ -167,6 +168,32 @@ class TerminalCapacityError(Exception):
         )
 
 
+class WaveReservationBindError(Exception):
+    """ADT-6: wave reservation cannot be bound before create side effects.
+
+    Raised when ``wave_reservation_id`` is missing, expired, cancelled, or
+    already bound to a different terminal. Callers must abort create — never
+    produce an untracked live child after a failed bind.
+    """
+
+    def __init__(
+        self,
+        reservation_id: str,
+        terminal_id: Optional[str] = None,
+        *,
+        reason: str = "reservation missing, expired, cancelled, or conflict",
+    ) -> None:
+        self.reservation_id = reservation_id
+        self.terminal_id = terminal_id
+        self.reason = reason
+        super().__init__(
+            f"Wave reservation bind failed for reservation_id={reservation_id}"
+            + (f" terminal_id={terminal_id}" if terminal_id else "")
+            + f": {reason}. Abort create before workspace/tmux/provider side effects; "
+            f"re-admit and retry."
+        )
+
+
 async def create_terminal(
     provider: str,
     agent_profile: str,
@@ -181,6 +208,8 @@ async def create_terminal(
     initial_message: Optional[str] = None,
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
+    workspace: Optional[str] = None,
+    wave_reservation_id: Optional[str] = None,
 ) -> Terminal:
     """Create a new terminal with an initialized CLI agent.
 
@@ -215,6 +244,17 @@ async def create_terminal(
             (e.g. MCP handoff/assign's own `model` parameter) pin a specific
             model for one worker without needing a dedicated agent profile.
             None = behavior unchanged (profile.model, if any, still applies).
+        workspace: Optional workspace backend selection
+            (``auto|shared|worktree|rift``). Precedence: this arg >
+            ``CAO_WORKSPACE_BACKEND`` > ``shared``. When resolved to
+            ``worktree``, the provider/terminal cwd becomes the new worktree
+            path (D12: provider memory files are per-workspace).
+        wave_reservation_id: Optional ADT-6 wave reservation to bind BEFORE any
+            expensive/externally-visible workspace/tmux/provider work. Binding
+            clears the unbound lease so slow create cannot exceed the wave cap.
+            Bind failure aborts create with ``WaveReservationBindError`` (no
+            untracked live child). On later create failure the bound reservation
+            is released idempotently in cleanup.
 
     Returns:
         Terminal object with all metadata populated
@@ -222,6 +262,7 @@ async def create_terminal(
     Raises:
         ValueError: If session already exists (new_session=True) or not found (new_session=False)
         TerminalCapacityError: If the session is already at CAO_MAX_ACTIVE_TERMINALS (D7)
+        WaveReservationBindError: If ``wave_reservation_id`` cannot be bound before side effects
         TimeoutError: If provider initialization times out
     """
     session_created = False  # tracks whether THIS call created the tmux session
@@ -233,8 +274,12 @@ async def create_terminal(
     # new one, but had no equivalent for a window added to a session that
     # already existed — see the `except` block.
     window_created = False
+    workspace_info = None
+    wave_bound = False
+    terminal_id: Optional[str] = None
     try:
-        # Step 1: Generate unique identifiers
+        # Step 1: Generate unique identifiers, then bind any wave reservation
+        # BEFORE workspace/tmux/provider side effects (ADT-6 unbound-lease race).
         terminal_id = generate_terminal_id()
 
         if not session_name:
@@ -247,6 +292,17 @@ async def create_terminal(
         if new_session and not session_name.startswith(SESSION_PREFIX):
             session_name = f"{SESSION_PREFIX}{session_name}"
 
+        if wave_reservation_id:
+            from cli_agent_orchestrator.services.wave_concurrency import wave_service
+
+            if not wave_service.bind_terminal(wave_reservation_id, terminal_id):
+                raise WaveReservationBindError(
+                    wave_reservation_id,
+                    terminal_id,
+                    reason="reservation missing, expired, cancelled, or already bound",
+                )
+            wave_bound = True
+
         # D7: per-session admission control before any tmux/DB work.
         # "Active" = DB-tracked terminal rows for this session (not live tmux).
         if not new_session:
@@ -255,6 +311,21 @@ async def create_terminal(
             active = len(list_terminals_by_session(session_name))
             if active >= CAO_MAX_ACTIVE_TERMINALS:
                 raise TerminalCapacityError(session_name, active, CAO_MAX_ACTIVE_TERMINALS)
+
+        # D11: resolve workspace backend and (when not shared) create an
+        # isolated cwd before the pane starts. Worktree uses a committed ref
+        # only — dirty source state is never copied.
+        from_path = working_directory or os.getcwd()
+        from cli_agent_orchestrator.workspaces.factory import create_workspace_for_terminal
+        from cli_agent_orchestrator.workspaces.registry import persist_workspace_lifecycle
+
+        workspace_info = create_workspace_for_terminal(
+            from_path=from_path,
+            terminal_id=terminal_id,
+            workspace=workspace,
+        )
+        working_directory = workspace_info.path
+        persist_workspace_lifecycle(terminal_id, workspace_info)
 
         # D6: every spawned window carries CAO_AGENT_DEPTH (absent ⇒ treat as 0
         # for operator-launched roots; assign/handoff pass parent+1 via env_vars).
@@ -343,6 +414,8 @@ async def create_terminal(
 
         # Step 3c: Persist terminal metadata to database after restrictions
         # are resolved so API reads and snapshots report the actual launch policy.
+        import json as _json
+
         db_create_terminal(
             terminal_id,
             session_name,
@@ -351,6 +424,7 @@ async def create_terminal(
             agent_profile,
             allowed_tools,
             caller_id=caller_id,
+            workspace_json=_json.dumps(workspace_info.model_dump()) if workspace_info else None,
         )
 
         # Step 4/5: Set up the FIFO event-driven output pipeline for pipe-pane
@@ -448,6 +522,10 @@ async def create_terminal(
             caller_id=caller_id,
             allowed_tools=allowed_tools,
             shell_command=shell_command,
+            workspace_backend=workspace_info.backend if workspace_info else None,
+            workspace_path=workspace_info.path if workspace_info else None,
+            workspace_branch=workspace_info.branch if workspace_info else None,
+            workspace_base_ref=workspace_info.base_ref if workspace_info else None,
             status=initial_status,
             last_active=datetime.now(),
         )
@@ -480,16 +558,33 @@ async def create_terminal(
     except Exception as e:
         # Cleanup on failure: clean up FIFO reader, status monitor, provider, and session
         logger.error(f"Failed to create terminal: {e}")
+        # ADT-6: if we bound a wave reservation before side effects, release it
+        # so a failed create cannot hold a lease-free slot forever. Idempotent.
+        # TerminalCapacityError is excluded: callers (assign drain / MCP) must
+        # release_reservation_and_requeue_front to preserve FIFO under D7.
+        if wave_bound and wave_reservation_id and not isinstance(e, TerminalCapacityError):
+            try:
+                from cli_agent_orchestrator.services.wave_concurrency import wave_service
+                from cli_agent_orchestrator.services.wave_drain import schedule_assign_drains
+
+                pending = wave_service.release(reservation_id=wave_reservation_id)
+                if pending:
+                    schedule_assign_drains(pending)
+            except Exception:
+                pass  # Ignore cleanup errors
         try:
-            fifo_manager.stop_reader(terminal_id)
+            if terminal_id:
+                fifo_manager.stop_reader(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         try:
-            status_monitor.clear_terminal(terminal_id)
+            if terminal_id:
+                status_monitor.clear_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         try:
-            provider_manager.cleanup_provider(terminal_id)
+            if terminal_id:
+                provider_manager.cleanup_provider(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         # Roll back the DB terminal row so a failed create does not leave an
@@ -499,7 +594,8 @@ async def create_terminal(
         # before the row was written. Runs regardless of session_created so a
         # pre-existing session keeps its live terminals but loses the dead row.
         try:
-            db_delete_terminal(terminal_id)
+            if terminal_id:
+                db_delete_terminal(terminal_id)
         except Exception:
             pass  # Ignore cleanup errors
         if session_created and session_name:
@@ -529,6 +625,19 @@ async def create_terminal(
                 get_backend().kill_window(session_name, window_name)
             except Exception:
                 pass  # Ignore cleanup errors
+        # D11: roll back an isolated worktree created before pane/DB failure.
+        if workspace_info is not None and workspace_info.backend != "shared":
+            try:
+                from cli_agent_orchestrator.workspaces.registry import (
+                    cleanup_workspace,
+                    persist_workspace_lifecycle,
+                )
+
+                cleanup = cleanup_workspace(workspace_info)
+                if terminal_id:
+                    persist_workspace_lifecycle(terminal_id, workspace_info, cleanup)
+            except Exception:
+                pass
         raise
 
 
@@ -872,6 +981,60 @@ def _schedule_deferred_init(
     task.add_done_callback(_deferred_init_tasks.discard)
 
 
+def _workspace_fields_from_metadata(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    """Decode optional workspace_json into Terminal-facing nullable fields."""
+    import json as _json
+
+    raw = metadata.get("workspace_json")
+    if not raw:
+        return {
+            "workspace_backend": None,
+            "workspace_path": None,
+            "workspace_branch": None,
+            "workspace_base_ref": None,
+        }
+    try:
+        data = _json.loads(raw) if isinstance(raw, str) else raw
+    except (TypeError, ValueError):
+        return {
+            "workspace_backend": None,
+            "workspace_path": None,
+            "workspace_branch": None,
+            "workspace_base_ref": None,
+        }
+    return {
+        "workspace_backend": data.get("backend"),
+        "workspace_path": data.get("path"),
+        "workspace_branch": data.get("branch"),
+        "workspace_base_ref": data.get("base_ref"),
+    }
+
+
+def _parse_workspace_info(metadata: Optional[Dict[str, Any]]):
+    """Load WorkspaceInfo from terminal metadata or lifecycle file."""
+    import json as _json
+
+    from cli_agent_orchestrator.workspaces.models import WorkspaceInfo
+    from cli_agent_orchestrator.workspaces.registry import load_workspace_lifecycle
+
+    if metadata and metadata.get("workspace_json"):
+        try:
+            raw = metadata["workspace_json"]
+            data = _json.loads(raw) if isinstance(raw, str) else raw
+            return WorkspaceInfo.model_validate(data)
+        except Exception:
+            pass
+    terminal_id = (metadata or {}).get("id")
+    if terminal_id:
+        life = load_workspace_lifecycle(terminal_id)
+        if life and life.get("workspace"):
+            try:
+                return WorkspaceInfo.model_validate(life["workspace"])
+            except Exception:
+                return None
+    return None
+
+
 def get_terminal(terminal_id: str) -> Dict:
     """Get terminal data."""
     try:
@@ -881,6 +1044,7 @@ def get_terminal(terminal_id: str) -> Dict:
 
         status = status_monitor.get_status(terminal_id).value
 
+        workspace_fields = _workspace_fields_from_metadata(metadata)
         return {
             "id": metadata["id"],
             "name": metadata["tmux_window"],
@@ -891,6 +1055,7 @@ def get_terminal(terminal_id: str) -> Dict:
             "allowed_tools": metadata.get("allowed_tools"),
             "status": status,
             "last_active": metadata["last_active"],
+            **workspace_fields,
         }
 
     except Exception as e:
@@ -1357,7 +1522,57 @@ def read_terminal_transcript(
 
 
 def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) -> bool:
-    """Delete terminal and kill its tmux window."""
+    """Delete terminal and kill its tmux window.
+
+    Public teardown seam: returns ``True`` when the DB row was deleted, ``False``
+    otherwise. Callers that need workspace cleanup metadata after teardown must
+    use :func:`get_workspace_public_fields` (read-only lifecycle accessor) — do
+    not bypass this seam via ``delete_terminal_with_result`` from substrate code.
+    """
+    result = delete_terminal_with_result(terminal_id, registry=registry)
+    return bool(result.get("success"))
+
+
+def get_workspace_public_fields(terminal_id: str) -> Dict[str, Any]:
+    """Read-only public workspace/cleanup fields from the lifecycle file.
+
+    Survives ``delete_terminal`` (metadata is persisted under TERMINAL_LOG_DIR
+    before the DB row is removed). Safe to call after the public delete seam.
+    """
+    from cli_agent_orchestrator.workspaces.models import (
+        WorkspaceCleanupResult,
+        WorkspaceInfo,
+    )
+    from cli_agent_orchestrator.workspaces.registry import load_workspace_lifecycle
+
+    life = load_workspace_lifecycle(terminal_id)
+    if not life:
+        return {}
+    out: Dict[str, Any] = {}
+    raw_ws = life.get("workspace")
+    if raw_ws:
+        try:
+            out.update(WorkspaceInfo.model_validate(raw_ws).to_public_dict())
+        except Exception:
+            pass
+    raw_cleanup = life.get("cleanup")
+    if raw_cleanup:
+        try:
+            out.update(WorkspaceCleanupResult.model_validate(raw_cleanup).to_public_dict())
+        except Exception:
+            pass
+    return out
+
+
+def delete_terminal_with_result(
+    terminal_id: str, registry: PluginRegistry | None = None
+) -> Dict[str, Any]:
+    """Delete terminal and return success plus optional workspace cleanup fields.
+
+    Additive rich-result companion to :func:`delete_terminal` for HTTP/API
+    responses. Substrate teardown (``run_agent_step``) must keep using
+    :func:`delete_terminal` and read metadata via :func:`get_workspace_public_fields`.
+    """
     try:
         # Unregister from herdr inbox service
         svc = get_herdr_inbox_service()
@@ -1396,6 +1611,7 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     ),
                     "allowed_tools": metadata.get("allowed_tools"),
                     "caller_id": metadata.get("caller_id"),
+                    "workspace_json": metadata.get("workspace_json"),
                 }
                 snapshot_path = TERMINAL_LOG_DIR / f"{terminal_id}.snapshot.json"
                 snapshot_path.write_text(_json.dumps(snapshot, indent=2), encoding="utf-8")
@@ -1437,6 +1653,43 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
         from cli_agent_orchestrator.services.memory_service import _curator_locks
 
         _curator_locks.pop(terminal_id, None)
+        # D11 cleanup BEFORE DB delete so metadata is still available; persist
+        # lifecycle so handoff/assign can read cleanup after the row is gone.
+        from cli_agent_orchestrator.workspaces.models import WorkspaceCleanupStatus
+        from cli_agent_orchestrator.workspaces.registry import (
+            cleanup_workspace,
+            load_workspace_lifecycle,
+            persist_workspace_lifecycle,
+        )
+
+        workspace_info = _parse_workspace_info(metadata)
+        cleanup_result = None
+        prior = load_workspace_lifecycle(terminal_id)
+        # Only skip re-cleanup for terminal policy outcomes. Transient /
+        # pending / unknown prior results must remain retryable without force.
+        _TERMINAL_CLEANUP = {
+            WorkspaceCleanupStatus.REMOVED,
+            WorkspaceCleanupStatus.NOOP,
+            WorkspaceCleanupStatus.PRESERVED_DIRTY,
+        }
+        if prior and prior.get("cleanup"):
+            try:
+                from cli_agent_orchestrator.workspaces.models import WorkspaceCleanupResult
+
+                prior_cleanup = WorkspaceCleanupResult.model_validate(prior["cleanup"])
+                prior_status = prior_cleanup.status
+                if isinstance(prior_status, str):
+                    prior_status = WorkspaceCleanupStatus(prior_status)
+                if prior_status in _TERMINAL_CLEANUP:
+                    cleanup_result = prior_cleanup
+            except Exception:
+                cleanup_result = None
+        if cleanup_result is None and workspace_info is not None:
+            cleanup_result = cleanup_workspace(workspace_info)
+            persist_workspace_lifecycle(terminal_id, workspace_info, cleanup_result)
+        elif workspace_info is not None:
+            persist_workspace_lifecycle(terminal_id, workspace_info, cleanup_result)
+
         deleted = db_delete_terminal(terminal_id)
         logger.info(f"Deleted terminal: {terminal_id}")
         if deleted and metadata:
@@ -1449,7 +1702,36 @@ def delete_terminal(terminal_id: str, registry: PluginRegistry | None = None) ->
                     agent_name=metadata.get("agent_profile"),
                 ),
             )
-        return deleted
+        # ADT-6: release wave slot (if any) and drain FIFO — must not be
+        # bypassable by API vs MCP delete paths. Also recovers assign requests
+        # parked on CAO_MAX_ACTIVE_TERMINALS after any session deletion.
+        try:
+            from cli_agent_orchestrator.services.wave_concurrency import wave_service
+            from cli_agent_orchestrator.services.wave_drain import (
+                schedule_assign_drains,
+            )
+
+            pending = wave_service.on_terminal_deleted(terminal_id)
+            if pending:
+                schedule_assign_drains(pending)
+        except Exception as wave_exc:  # noqa: BLE001 — never fail delete on wave bookkeeping
+            logger.warning(
+                "Wave release/drain after delete of %s failed: %s",
+                terminal_id,
+                wave_exc,
+            )
+        result: Dict[str, Any] = {"success": bool(deleted)}
+        if workspace_info is not None:
+            result.update(workspace_info.to_public_dict())
+        if cleanup_result is not None:
+            result.update(cleanup_result.to_public_dict())
+            if cleanup_result.status == WorkspaceCleanupStatus.PRESERVED_DIRTY:
+                logger.warning(
+                    "Terminal %s deleted but workspace preserved (dirty): %s",
+                    terminal_id,
+                    cleanup_result.message,
+                )
+        return result
 
     except Exception as e:
         logger.error(f"Failed to delete terminal {terminal_id}: {e}")

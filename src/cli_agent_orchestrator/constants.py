@@ -650,6 +650,46 @@ CAO_MAX_AGENT_DEPTH = _env_int("CAO_MAX_AGENT_DEPTH", 3)
 # "Active" = DB-tracked terminal rows for the session (list_terminals_by_session).
 CAO_MAX_ACTIVE_TERMINALS = _env_int("CAO_MAX_ACTIVE_TERMINALS", 12)
 
+# ADT-6: per-supervisor wave concurrency for assign/handoff children. Caps how
+# many in-flight (RUNNING/PROCESSING + IDLE-awaiting-callback) children one
+# supervisor may hold at once. Excess requests are FIFO-queued server-side.
+# Shared budget across assign and handoff. Assign holds a slot until explicit
+# delete_terminal; handoff holds until the handoff call completes. Global
+# CAO_MAX_ACTIVE_TERMINALS remains the hard session ceiling and is never
+# overrun by queue drain. Default 3 matches practical single-wave fan-out.
+CAO_MAX_WAVE_IN_FLIGHT = _env_int("CAO_MAX_WAVE_IN_FLIGHT", 3)
+
+# Cap for ``GET /wave/wait/{queue_id}`` and MCP wait_for_admission (seconds).
+# Long-poll only (no busy poll). Default 5 min / hard ceiling 15 min — enough for
+# a wave drain cycle without holding HTTP workers for an hour.
+_WAVE_WAIT_TIMEOUT_DEFAULT = 300
+_WAVE_WAIT_TIMEOUT_CEILING = 900
+CAO_WAVE_WAIT_TIMEOUT_MAX = min(
+    max(1, _env_int("CAO_WAVE_WAIT_TIMEOUT_MAX", _WAVE_WAIT_TIMEOUT_DEFAULT)),
+    _WAVE_WAIT_TIMEOUT_CEILING,
+)
+
+# ADT-6: unbound in-flight reservation lease (monotonic seconds). Covers the
+# window after admit and before create/bind so MCP death cannot steal a slot
+# forever. Bound live terminals never expire (deletion owns cleanup).
+CAO_WAVE_UNBOUND_LEASE_S = _env_positive_float("CAO_WAVE_UNBOUND_LEASE_S", 30.0)
+
+# ADT-6: queued handoff ownership lease (monotonic seconds). try_admit registers
+# live intent atomically; this lease covers the TOCTOU gap before
+# wait_for_admission begins. Active HTTP waiters refresh/hold ownership.
+CAO_WAVE_HANDOFF_QUEUE_LEASE_S = _env_positive_float("CAO_WAVE_HANDOFF_QUEUE_LEASE_S", 60.0)
+
+# D11 / T1.4: workspace backend selection (shared | worktree | rift | auto).
+# Precedence: explicit assign/handoff/HTTP ``workspace=`` > this env > ``shared``.
+# ``shared`` remains the shipped default (no behaviour change until opted in).
+# ``auto`` probes rift → worktree → loud shared fallback. See
+# docs/workspace-backends.md and docs/issues/swarm-economics/design.md D11–D13.
+CAO_WORKSPACE_BACKEND = os.environ.get("CAO_WORKSPACE_BACKEND", "shared").strip() or "shared"
+
+# Isolated worktree checkouts live here (not inside the source repo tree).
+WORKSPACES_DIR = CAO_HOME_DIR / "workspaces"
+WORKSPACES_DIR.mkdir(parents=True, exist_ok=True, mode=0o700)
+
 # Pre-regex length cap on run-step env-var VALUES (U2-BR-2). Defense-in-depth,
 # not redundancy: bounds the input O(1) before any regex evaluation and bounds
 # what can be staged into a terminal environment regardless of future regex
@@ -681,3 +721,17 @@ WORKFLOW_SCRIPT_TERM_GRACE = 5.0  # SIGTERM->SIGKILL grace (BR-10/11, NFR-REL-1)
 WORKFLOW_SCRIPT_TIMEOUT = 8700.0
 WORKFLOW_SCRIPT_LOG_CAP = 256 * 1024  # per-stream tail cap, bytes (BR-24/25, Q7=A)
 WORKFLOW_SCRIPT_SCRATCH_DIR = CAO_HOME_DIR / "workflow-script-scratch"  # 0o700 (BR-30)
+
+# =============================================================================
+# Handoff done_cmd verifier (ADT-3)
+# =============================================================================
+# Mechanical acceptance runs after worker capture completes. Timeout is centrally
+# capped — handoff callers cannot request an arbitrary wait.
+_DONE_CMD_TIMEOUT_DEFAULT = 120
+_DONE_CMD_TIMEOUT_CEILING = 120
+DONE_CMD_TIMEOUT_SECONDS = min(
+    max(1, _env_int("CAO_DONE_CMD_TIMEOUT_SECONDS", _DONE_CMD_TIMEOUT_DEFAULT)),
+    _DONE_CMD_TIMEOUT_CEILING,
+)
+# Tail cap on combined stdout+stderr returned in HandoffResult.done_cmd_output.
+DONE_CMD_OUTPUT_MAX_CHARS = 8192

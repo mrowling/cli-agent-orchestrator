@@ -200,20 +200,22 @@ class TestHandoffOutcomes:
     def test_success_returns_output_and_terminal_id(self, mock_provider, _nudge):
         """On success the worker output + terminal id are surfaced; the server
         owns teardown (the request asks for teardown=True)."""
-        mock_provider.return_value = _ctx("kiro_cli")
+        mock_provider.return_value = _ctx("kiro_cli", caller_id="a1b2c3d4")
 
-        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
-            mock_requests.post.return_value = _ok_run_step_response(
-                terminal_id="dev-t1", last_message="done"
-            )
-            mock_requests.Timeout = Exception
-            result = asyncio.run(_handoff_impl("developer", "Do task"))
+        with patch.dict(os.environ, {"CAO_TERMINAL_ID": "a1b2c3d4"}):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                mock_requests.post.return_value = _ok_run_step_response(
+                    terminal_id="dev-t1", last_message="done"
+                )
+                mock_requests.Timeout = Exception
+                result = asyncio.run(_handoff_impl("developer", "Do task"))
 
         assert result.success is True
         assert result.output == "done"
         assert result.terminal_id == "dev-t1"
-        # The single combined call requests server-side teardown.
+        # The single combined call requests server-side teardown when done_cmd omitted.
         assert mock_requests.post.call_args[1]["json"]["teardown"] is True
+        assert mock_requests.post.call_args[1]["json"]["wave_reservation_id"] == "wres-test-handoff"
 
     @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
     def test_endpoint_504_maps_to_timeout_result(self, mock_provider):
@@ -400,6 +402,291 @@ class TestHandoffModelOverride:
         assert result.success is True
         payload = mock_requests.post.call_args[1]["json"]
         assert "model" not in payload
+
+
+class TestHandoffDoneSentinelCapture:
+    """ADT-1: successful handoff scans captured output for done sentinel fields."""
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_parses_done_sentinel_from_last_message(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+        output = "Implemented fix.\n===CAO_DONE=== status=ok summary=Tests green"
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(last_message=output)
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        assert result.done_status == "ok"
+        assert result.done_summary == "Tests green"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_missing_sentinel_keeps_success_and_null_fields(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(last_message="All done")
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        assert result.success is True
+        assert result.done_status is None
+        assert result.done_summary is None
+
+
+class TestHandoffDoneCmdVerifier:
+    """ADT-3: optional done_cmd mechanical acceptance after capture."""
+
+    _PASS_CMD = f'{__import__("sys").executable} -c "import sys; sys.exit(0)"'
+    _FAIL_CMD = f'{__import__("sys").executable} -c "import sys; sys.exit(1)"'
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_done_cmd_pass_accepts_handoff(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code", caller_id="sup12345")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(
+                last_message="===CAO_DONE=== status=ok summary=Done"
+            )
+            del_resp = MagicMock()
+            del_resp.status_code = 200
+            del_resp.content = b'{"success": true}'
+            del_resp.json.return_value = {"success": True}
+            mock_requests.delete.return_value = del_resp
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", done_cmd=self._PASS_CMD))
+
+        assert result.success is True
+        assert result.done_status == "ok"
+        assert result.done_cmd == self._PASS_CMD
+        assert result.done_cmd_exit == 0
+        assert result.done_cmd_error is None
+        # done_cmd ⇒ teardown=False on run-step; explicit delete after verifier pass.
+        assert mock_requests.post.call_args[1]["json"]["teardown"] is False
+        mock_requests.delete.assert_called_once()
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_done_cmd_fail_despite_ok_sentinel(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(
+                last_message="===CAO_DONE=== status=ok summary=Looks fine"
+            )
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", done_cmd=self._FAIL_CMD))
+
+        assert result.success is False
+        assert result.done_status == "ok"
+        assert result.done_summary == "Looks fine"
+        assert result.done_cmd_exit == 1
+        assert "Handoff verifier failed" in result.message
+        assert "worker sentinel: status=ok" in result.message
+        # Verifier failure preserves evidence — no delete.
+        mock_requests.delete.assert_not_called()
+        assert mock_requests.post.call_args[1]["json"]["teardown"] is False
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.run_done_cmd")
+    def test_omitted_done_cmd_no_verifier(self, mock_run_done_cmd, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task"))
+
+        mock_run_done_cmd.assert_not_called()
+        assert result.success is True
+        assert result.done_cmd is None
+        assert result.done_cmd_exit is None
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    @patch("cli_agent_orchestrator.mcp_server.server.run_done_cmd")
+    def test_done_cmd_timeout_fails_handoff(self, mock_run_done_cmd, mock_provider, _nudge):
+        from cli_agent_orchestrator.mcp_server.done_cmd_verifier import DoneCmdVerification
+
+        mock_provider.return_value = _ctx("claude_code")
+        mock_run_done_cmd.return_value = DoneCmdVerification(
+            done_cmd="sleep 999",
+            timed_out=True,
+            error="done_cmd timed out after 120s",
+        )
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response(
+                last_message="===CAO_DONE=== status=ok summary=Done"
+            )
+            mock_requests.Timeout = Exception
+            result = asyncio.run(_handoff_impl("developer", "Do task", done_cmd="sleep 999"))
+
+        assert result.success is False
+        assert result.done_cmd_timed_out is True
+        assert result.done_status == "ok"
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_done_cmd_uses_explicit_worker_cwd(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code", caller_id="a1b2c3d4")
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.Timeout = Exception
+            with patch("cli_agent_orchestrator.mcp_server.server.run_done_cmd") as mock_run:
+                from cli_agent_orchestrator.mcp_server.done_cmd_verifier import (
+                    DoneCmdVerification,
+                )
+
+                mock_run.return_value = DoneCmdVerification(done_cmd=self._PASS_CMD, exit_code=0)
+                del_resp = MagicMock()
+                del_resp.status_code = 200
+                del_resp.content = b"{}"
+                del_resp.json.return_value = {"success": True}
+                mock_requests.delete.return_value = del_resp
+                asyncio.run(
+                    _handoff_impl(
+                        "developer",
+                        "Do task",
+                        working_directory="/explicit/cwd",
+                        done_cmd=self._PASS_CMD,
+                    )
+                )
+                mock_run.assert_called_once_with(self._PASS_CMD, cwd="/explicit/cwd")
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_done_cmd_inherits_caller_cwd_when_unset(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code", caller_id="a1b2c3d4")
+        wd_resp = MagicMock()
+        wd_resp.status_code = 200
+        wd_resp.json.return_value = {"working_directory": "/supervisor/cwd"}
+
+        with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+            mock_requests.post.return_value = _ok_run_step_response()
+            mock_requests.get.return_value = wd_resp
+            mock_requests.Timeout = Exception
+            with patch("cli_agent_orchestrator.mcp_server.server.run_done_cmd") as mock_run:
+                from cli_agent_orchestrator.mcp_server.done_cmd_verifier import (
+                    DoneCmdVerification,
+                )
+
+                mock_run.return_value = DoneCmdVerification(done_cmd=self._PASS_CMD, exit_code=0)
+                del_resp = MagicMock()
+                del_resp.status_code = 200
+                del_resp.content = b"{}"
+                del_resp.json.return_value = {"success": True}
+                mock_requests.delete.return_value = del_resp
+                asyncio.run(_handoff_impl("developer", "Do task", done_cmd=self._PASS_CMD))
+                mock_run.assert_called_once_with(self._PASS_CMD, cwd="/supervisor/cwd")
+
+
+class TestHandoffDoneCmdWaveRelease:
+    """ADT-6: post-verifier delete success/failure wave slot ownership."""
+
+    _PASS_CMD = f'{__import__("sys").executable} -c "import sys; sys.exit(0)"'
+    _WRES = "wres-test-handoff"
+
+    def _run_verifier_pass_handoff(self, del_resp, mock_release):
+        with patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value=""):
+            with patch(
+                "cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider"
+            ) as mock_provider:
+                mock_provider.return_value = _ctx("claude_code", caller_id="sup12345")
+                with patch(
+                    "cli_agent_orchestrator.mcp_server.server.wave_client.release",
+                    side_effect=mock_release,
+                ):
+                    with patch(
+                        "cli_agent_orchestrator.mcp_server.server.requests"
+                    ) as mock_requests:
+                        mock_requests.post.return_value = _ok_run_step_response(
+                            last_message="===CAO_DONE=== status=ok summary=Done"
+                        )
+                        mock_requests.delete.return_value = del_resp
+                        mock_requests.Timeout = Exception
+                        return asyncio.run(
+                            _handoff_impl("developer", "Do task", done_cmd=self._PASS_CMD)
+                        )
+
+    @patch("cli_agent_orchestrator.mcp_server.server._get_cleanup_nudge", return_value="")
+    @patch("cli_agent_orchestrator.mcp_server.server._resolve_handoff_provider")
+    def test_successful_delete_skips_finally_release(self, mock_provider, _nudge):
+        mock_provider.return_value = _ctx("claude_code", caller_id="sup12345")
+        releases = []
+
+        del_resp = MagicMock()
+        del_resp.status_code = 200
+        del_resp.content = b'{"success": true, "workspace_cleanup_status": "removed"}'
+        del_resp.json.return_value = {
+            "success": True,
+            "workspace_cleanup_status": "removed",
+        }
+
+        with patch(
+            "cli_agent_orchestrator.mcp_server.server.wave_client.release",
+            side_effect=lambda *a, **k: releases.append(k.get("reservation_id")),
+        ):
+            with patch("cli_agent_orchestrator.mcp_server.server.requests") as mock_requests:
+                mock_requests.post.return_value = _ok_run_step_response(
+                    last_message="===CAO_DONE=== status=ok summary=Done"
+                )
+                mock_requests.delete.return_value = del_resp
+                mock_requests.Timeout = Exception
+                result = asyncio.run(_handoff_impl("developer", "Do task", done_cmd=self._PASS_CMD))
+
+        assert result.success is True
+        assert result.workspace_cleanup_status == "removed"
+        assert releases == []
+        mock_requests.delete.assert_called_once()
+
+    def test_failed_delete_non_200_triggers_finally_release(self):
+        releases = []
+        del_resp = MagicMock()
+        del_resp.status_code = 500
+        del_resp.content = b'{"detail": "boom"}'
+        del_resp.json.return_value = {"detail": "boom"}
+
+        result = self._run_verifier_pass_handoff(
+            del_resp, lambda *a, **k: releases.append(k.get("reservation_id"))
+        )
+
+        assert result.success is True
+        assert releases == [self._WRES]
+
+    def test_delete_200_success_false_triggers_finally_release(self):
+        releases = []
+        del_resp = MagicMock()
+        del_resp.status_code = 200
+        del_resp.content = b'{"success": false, "message": "not found"}'
+        del_resp.json.return_value = {"success": False, "message": "not found"}
+
+        result = self._run_verifier_pass_handoff(
+            del_resp, lambda *a, **k: releases.append(k.get("reservation_id"))
+        )
+
+        assert result.success is True
+        assert releases == [self._WRES]
+
+    def test_delete_malformed_body_triggers_finally_release(self):
+        releases = []
+        del_resp = MagicMock()
+        del_resp.status_code = 200
+        del_resp.content = b"not-json"
+        del_resp.json.side_effect = ValueError("bad json")
+
+        result = self._run_verifier_pass_handoff(
+            del_resp, lambda *a, **k: releases.append(k.get("reservation_id"))
+        )
+
+        assert result.success is True
+        assert releases == [self._WRES]
 
 
 class TestResolveHandoffProvider:

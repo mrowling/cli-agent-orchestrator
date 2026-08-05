@@ -125,6 +125,7 @@ from cli_agent_orchestrator.services.terminal_service import (
     OutputMode,
     TerminalCapacityError,
     TerminalInputBlockedError,
+    WaveReservationBindError,
 )
 from cli_agent_orchestrator.telemetry import init_telemetry, shutdown_telemetry
 from cli_agent_orchestrator.utils.agent_profiles import load_agent_profile, resolve_provider
@@ -277,6 +278,17 @@ class CreateTerminalBody(BaseModel):
     initial_message: Optional[str] = None
     initial_message_orchestration_type: Optional[str] = None
     env_vars: Optional[Dict[str, str]] = None
+    workspace: Optional[str] = Field(
+        default=None,
+        description=(
+            "Workspace backend: auto|shared|worktree|rift. Precedence over "
+            "CAO_WORKSPACE_BACKEND; default shared. See docs/workspace-backends.md (D11)."
+        ),
+    )
+    wave_reservation_id: Optional[str] = Field(
+        default=None,
+        description=("ADT-6 wave reservation bound at terminal create time (assign path)."),
+    )
 
 
 class CreateSessionBody(CreateTerminalBody):
@@ -332,6 +344,13 @@ class RunStepRequest(BaseModel):
     working_directory: Optional[str] = Field(
         default=None, description="Working directory for a freshly created terminal"
     )
+    workspace: Optional[str] = Field(
+        default=None,
+        description=(
+            "Workspace backend for a freshly created terminal: auto|shared|worktree|rift "
+            "(D11). Precedence: this field > CAO_WORKSPACE_BACKEND > shared."
+        ),
+    )
     caller_id: Optional[str] = Field(
         default=None,
         description="Supervisor terminal ID to record for structural callback routing (#284)",
@@ -355,6 +374,13 @@ class RunStepRequest(BaseModel):
             "(ignored when reusing a terminal), applied ahead of the agent "
             "profile's own static model field. Lets a caller pin a specific "
             "model for one worker without a dedicated agent profile."
+        ),
+    )
+    wave_reservation_id: Optional[str] = Field(
+        default=None,
+        description=(
+            "ADT-6 wave reservation to bind server-side as soon as the terminal "
+            "is created (prevents slot leak if the MCP client dies mid-step)."
         ),
     )
 
@@ -452,6 +478,15 @@ class RunStepResponse(BaseModel):
     terminal_id: str
     last_message: str
     status: str
+    # D11 workspace fields (nullable — shared default / no isolation).
+    workspace_backend: Optional[str] = None
+    workspace_path: Optional[str] = None
+    workspace_branch: Optional[str] = None
+    workspace_base_ref: Optional[str] = None
+    workspace_diff: Optional[str] = None
+    workspace_cleanup_status: Optional[str] = None
+    workspace_cleanup_message: Optional[str] = None
+    workspace_retained_branch: Optional[str] = None
 
 
 class WorkflowValidateRequest(BaseModel):
@@ -695,6 +730,22 @@ async def lifespan(app: FastAPI):
     # Register event loop with event bus for thread-safe publishing
     loop = asyncio.get_running_loop()
     bus.set_loop(loop)
+    # ADT-6: wave assign drain needs the same loop (delete runs in to_thread).
+    from cli_agent_orchestrator.services.wave_drain import set_event_loop as set_wave_loop
+
+    set_wave_loop(loop)
+    # ADT-6: rebuild conservative in-flight reservations from live terminals
+    # with caller_id so a restart cannot reset the wave cap while children live.
+    # Queued-but-not-started requests are in-memory and intentionally lost.
+    try:
+        from cli_agent_orchestrator.clients.database import list_terminals_with_caller
+        from cli_agent_orchestrator.services.wave_concurrency import wave_service
+
+        restored = wave_service.reconcile_in_flight_from_terminals(list_terminals_with_caller())
+        if restored:
+            logger.info("Wave reconcile restored %s in-flight reservation(s)", restored)
+    except Exception:
+        logger.warning("Wave in-flight reconcile at startup failed", exc_info=True)
 
     # Start event bus consumers as background tasks
     status_monitor_task = asyncio.create_task(status_monitor.run())
@@ -2021,18 +2072,22 @@ async def create_session(
         # Parse comma-separated allowed_tools string into list
         allowed_tools_list = allowed_tools.split(",") if allowed_tools else None
 
-        result = await session_service.create_session(
-            provider=provider,
-            agent_profile=agent_profile,
-            session_name=session_name,
-            working_directory=working_directory,
-            allowed_tools=allowed_tools_list,
-            registry=get_plugin_registry(request),
-            env_vars=body.env_vars if body else None,
-            initial_message=initial_message,
-            initial_message_orchestration_type=initial_message_orchestration_type,
-            model=model,
-        )
+        create_session_kwargs: Dict[str, Any] = {
+            "provider": provider,
+            "agent_profile": agent_profile,
+            "session_name": session_name,
+            "working_directory": working_directory,
+            "allowed_tools": allowed_tools_list,
+            "registry": get_plugin_registry(request),
+            "env_vars": body.env_vars if body else None,
+            "initial_message": initial_message,
+            "initial_message_orchestration_type": initial_message_orchestration_type,
+            "model": model,
+        }
+        workspace_val = body.workspace if body else None
+        if workspace_val is not None:
+            create_session_kwargs["workspace"] = workspace_val
+        result = await session_service.create_session(**create_session_kwargs)
 
         if memory_manager and str(memory_manager).lower() in ("true", "1", "yes"):
             registry = get_plugin_registry(request)
@@ -2217,21 +2272,26 @@ async def create_terminal_in_session(
                     ),
                 )
 
-        result = await terminal_service.create_terminal(
-            provider=resolved_provider,
-            agent_profile=agent_profile,
-            session_name=session_name,
-            new_session=False,
-            working_directory=working_directory,
-            allowed_tools=allowed_tools_list,
-            registry=get_plugin_registry(request),
-            caller_id=caller_id,
-            defer_init=defer_init,
-            initial_message=initial_message,
-            initial_message_orchestration_type=orch_type,
-            model=model,
-            env_vars=body.env_vars if body else None,
-        )
+        create_terminal_kwargs: Dict[str, Any] = {
+            "provider": resolved_provider,
+            "agent_profile": agent_profile,
+            "session_name": session_name,
+            "new_session": False,
+            "working_directory": working_directory,
+            "allowed_tools": allowed_tools_list,
+            "registry": get_plugin_registry(request),
+            "caller_id": caller_id,
+            "defer_init": defer_init,
+            "initial_message": initial_message,
+            "initial_message_orchestration_type": orch_type,
+            "model": model,
+            "env_vars": body.env_vars if body else None,
+            "wave_reservation_id": body.wave_reservation_id if body else None,
+        }
+        workspace_val = body.workspace if body else None
+        if workspace_val is not None:
+            create_terminal_kwargs["workspace"] = workspace_val
+        result = await terminal_service.create_terminal(**create_terminal_kwargs)
         return result
     except HTTPException:
         # Deliberate 4xx (e.g. the initial_message/defer_init guard, invalid
@@ -2243,6 +2303,12 @@ async def create_terminal_in_session(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=str(e),
             headers={"Retry-After": "5"},
+        )
+    except WaveReservationBindError as e:
+        # ADT-6: reservation expired/cancelled before create side effects.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
         )
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
@@ -2587,6 +2653,8 @@ async def run_step(
             env_vars=body.env_vars,
             on_terminal_created=on_terminal_created,
             model=body.model,
+            workspace=body.workspace,
+            wave_reservation_id=body.wave_reservation_id,
         )
         # Success -> transition the script step RUNNING->COMPLETED (no-op for
         # non-script callers). Before building the response so a settle failure
@@ -2596,6 +2664,14 @@ async def run_step(
             terminal_id=result.terminal_id,
             last_message=result.last_message,
             status=(result.status.value if hasattr(result.status, "value") else str(result.status)),
+            workspace_backend=result.workspace_backend,
+            workspace_path=result.workspace_path,
+            workspace_branch=result.workspace_branch,
+            workspace_base_ref=result.workspace_base_ref,
+            workspace_diff=result.workspace_diff,
+            workspace_cleanup_status=result.workspace_cleanup_status,
+            workspace_cleanup_message=result.workspace_cleanup_message,
+            workspace_retained_branch=result.workspace_retained_branch,
         )
     except StepExecutionError as e:
         # The step did not complete successfully. Distinguish a worker that
@@ -2623,6 +2699,12 @@ async def run_step(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail=str(e),
             headers={"Retry-After": "5"},
+        )
+    except WaveReservationBindError as e:
+        # ADT-6: reservation expired/cancelled before create side effects.
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=str(e),
         )
     except ValueError as e:
         # Unknown terminal / bad input surfaced by the terminal layer.
@@ -3183,12 +3265,23 @@ async def delete_terminal(
         # loop so a stalled tmux/FIFO op bounds its blast radius to this one
         # request instead of wedging the whole server (issue #382 fixed this
         # for DELETE /sessions; the per-terminal path had the same hazard).
+        # Public seam is delete_terminal(...)->bool; workspace cleanup fields
+        # come from the read-only lifecycle accessor after teardown.
         success = await asyncio.to_thread(
             terminal_service.delete_terminal,
             terminal_id,
             registry=get_plugin_registry(request),
         )
-        return {"success": success}
+        result: Dict[str, Any] = {"success": bool(success)}
+        try:
+            ws_fields = await asyncio.to_thread(
+                terminal_service.get_workspace_public_fields, terminal_id
+            )
+            if isinstance(ws_fields, dict):
+                result.update(ws_fields)
+        except Exception:
+            pass  # Additive metadata must not fail delete
+        return result
     except ValueError as e:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
     except Exception as e:
@@ -3196,6 +3289,289 @@ async def delete_terminal(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to delete terminal: {str(e)}",
         )
+
+
+# =============================================================================
+# ADT-6: Wave concurrency queue (per-supervisor assign/handoff budget)
+# =============================================================================
+
+
+class WaveAdmitBody(BaseModel):
+    supervisor_id: str = Field(description="Supervisor (caller) terminal id")
+    kind: str = Field(description="'assign' or 'handoff'")
+    payload: Dict[str, Any] = Field(
+        default_factory=dict,
+        description="Opaque request payload preserved for FIFO drain (message/options)",
+    )
+
+    @field_validator("supervisor_id")
+    @classmethod
+    def _validate_supervisor_id(cls, v: str) -> str:
+        # Same shape as TerminalId — MCP already uses 8-hex terminal ids.
+        if not re.fullmatch(r"^[a-f0-9]{8}$", v or ""):
+            raise ValueError("supervisor_id must be an 8-char hex terminal id")
+        return v
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in ("assign", "handoff"):
+            raise ValueError("kind must be 'assign' or 'handoff'")
+        return v
+
+
+class WaveBindBody(BaseModel):
+    reservation_id: str
+    terminal_id: str
+
+    @field_validator("terminal_id")
+    @classmethod
+    def _validate_terminal_id(cls, v: str) -> str:
+        if not re.fullmatch(r"^[a-f0-9]{8}$", v or ""):
+            raise ValueError("terminal_id must be an 8-char hex terminal id")
+        return v
+
+
+class WaveReleaseBody(BaseModel):
+    reservation_id: Optional[str] = None
+    terminal_id: Optional[str] = None
+
+    @field_validator("terminal_id")
+    @classmethod
+    def _validate_terminal_id(cls, v: Optional[str]) -> Optional[str]:
+        if v is None:
+            return v
+        if not re.fullmatch(r"^[a-f0-9]{8}$", v):
+            raise ValueError("terminal_id must be an 8-char hex terminal id")
+        return v
+
+
+class WaveRequeueBody(BaseModel):
+    reservation_id: str
+    kind: str
+    payload: Dict[str, Any] = Field(default_factory=dict)
+    queue_id: Optional[str] = None
+
+    @field_validator("kind")
+    @classmethod
+    def _validate_kind(cls, v: str) -> str:
+        if v not in ("assign", "handoff"):
+            raise ValueError("kind must be 'assign' or 'handoff'")
+        return v
+
+
+class WaveCancelBody(BaseModel):
+    queue_id: str
+    reason: str = "cancelled"
+
+
+@app.post("/wave/admit")
+async def wave_admit(
+    body: WaveAdmitBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Admit a wave slot or enqueue FIFO when CAO_MAX_WAVE_IN_FLIGHT is full.
+
+    Auth: SCOPE_WRITE (same as terminal create) so MCP internal calls work.
+    Cross-supervisor mutation under a shared SCOPE_WRITE token remains existing
+    terminal-admin authority (not a stronger multi-tenant boundary than
+    DELETE /terminals). Invisible permanent ghost slots are prevented by
+    unbound reservation leases + supervisor existence check where possible.
+    """
+    from cli_agent_orchestrator.services.wave_concurrency import (
+        WaveReconcileError,
+        wave_service,
+    )
+
+    # Harden against ghost reservations: reject admits whose supervisor_id does
+    # not name an existing terminal/caller when the DB is reachable. Lookup
+    # errors skip this check; reconcile still fail-closes admission.
+    skip_supervisor_check = False
+    try:
+        supervisor_meta = get_terminal_metadata(body.supervisor_id)
+    except Exception:
+        skip_supervisor_check = True
+        supervisor_meta = None
+    if not skip_supervisor_check and supervisor_meta is None:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=(f"supervisor_id {body.supervisor_id!r} does not name an " "existing terminal"),
+        )
+
+    try:
+        result = wave_service.try_admit(body.supervisor_id, body.kind, body.payload)
+    except WaveReconcileError as e:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(e),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    from cli_agent_orchestrator.services.wave_drain import schedule_assign_drains
+
+    pending = wave_service.pop_pending_assign_drains()
+    if pending:
+        schedule_assign_drains(pending)
+    return {
+        "status": result.status.value,
+        "reservation_id": result.reservation_id,
+        "queue_id": result.queue_id,
+        "position": result.position,
+        "terminal_id": result.terminal_id,
+        "message": result.message,
+    }
+
+
+@app.post("/wave/bind")
+async def wave_bind(
+    body: WaveBindBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Bind a created terminal id to an admitted wave reservation."""
+    from cli_agent_orchestrator.services.wave_concurrency import wave_service
+
+    ok = wave_service.bind_terminal(body.reservation_id, body.terminal_id)
+    if not ok:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Unknown or conflicting reservation_id: {body.reservation_id}",
+        )
+    return {"success": True}
+
+
+@app.post("/wave/release")
+async def wave_release(
+    body: WaveReleaseBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Release a known wave slot and drain that supervisor's FIFO.
+
+    Unknown reservation/terminal is a success no-op and does **not** trigger a
+    global drain (prevents unrelated handoff admission from stray release).
+    """
+    from cli_agent_orchestrator.services.wave_concurrency import wave_service
+    from cli_agent_orchestrator.services.wave_drain import schedule_assign_drains
+
+    if not body.reservation_id and not body.terminal_id:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="reservation_id or terminal_id required",
+        )
+    pending = await asyncio.to_thread(
+        wave_service.release,
+        reservation_id=body.reservation_id,
+        terminal_id=body.terminal_id,
+    )
+    if pending:
+        schedule_assign_drains(pending)
+    return {"success": True, "pending_assign_drains": pending}
+
+
+@app.post("/wave/requeue-front")
+async def wave_requeue_front(
+    body: WaveRequeueBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """After global-cap rejection: free the reservation and requeue at FIFO front."""
+    from cli_agent_orchestrator.services.wave_concurrency import wave_service
+
+    try:
+        queue_id = wave_service.release_reservation_and_requeue_front(
+            body.reservation_id,
+            kind=body.kind,
+            payload=body.payload,
+            queue_id=body.queue_id,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(e))
+    return {"status": "queued", "queue_id": queue_id}
+
+
+@app.post("/wave/cancel")
+async def wave_cancel(
+    body: WaveCancelBody,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Cancel/abandon a queued wave request (timeout / caller give-up)."""
+    from cli_agent_orchestrator.services.wave_concurrency import wave_service
+    from cli_agent_orchestrator.services.wave_drain import schedule_assign_drains
+
+    pending = await asyncio.to_thread(
+        wave_service.cancel_request, body.queue_id, reason=body.reason
+    )
+    if pending:
+        schedule_assign_drains(pending)
+    return {"success": True, "pending_assign_drains": pending}
+
+
+@app.get("/wave/wait/{queue_id}")
+async def wave_wait(
+    queue_id: str,
+    timeout: Optional[float] = None,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Block until a queued wave request is admitted (threading.Event; no poll).
+
+    ``timeout`` is clamped to ``CAO_WAVE_WAIT_TIMEOUT_MAX`` (never unbounded).
+    """
+    from cli_agent_orchestrator.constants import CAO_WAVE_WAIT_TIMEOUT_MAX
+    from cli_agent_orchestrator.services.wave_concurrency import wave_service
+
+    if timeout is None:
+        clamped: Optional[float] = float(CAO_WAVE_WAIT_TIMEOUT_MAX)
+    else:
+        try:
+            clamped = float(timeout)
+        except (TypeError, ValueError):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="timeout must be a number",
+            )
+        if clamped <= 0:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="timeout must be positive",
+            )
+        clamped = min(clamped, float(CAO_WAVE_WAIT_TIMEOUT_MAX))
+
+    result = await asyncio.to_thread(wave_service.wait_for_admission, queue_id, clamped)
+    from cli_agent_orchestrator.services.wave_drain import schedule_assign_drains
+
+    pending = wave_service.pop_pending_assign_drains()
+    if pending:
+        schedule_assign_drains(pending)
+    return {
+        "status": result.status.value,
+        "reservation_id": result.reservation_id,
+        "queue_id": result.queue_id,
+        "terminal_id": result.terminal_id,
+        "message": result.message,
+    }
+
+
+@app.get("/wave/status/{supervisor_id}")
+async def wave_status(
+    supervisor_id: str,
+    _scopes: List[str] = Depends(require_any_scope(SCOPE_READ, SCOPE_WRITE, SCOPE_ADMIN)),
+) -> Dict[str, Any]:
+    """Inspect in-flight + queued wave state for a supervisor (tests/ops).
+
+    Reaps expired unbound reservations / abandoned handoff leases before
+    returning the snapshot (event-driven; no background poll).
+    """
+    if not re.fullmatch(r"^[a-f0-9]{8}$", supervisor_id or ""):
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="supervisor_id must be an 8-char hex terminal id",
+        )
+    from cli_agent_orchestrator.services.wave_concurrency import wave_service
+    from cli_agent_orchestrator.services.wave_drain import schedule_assign_drains
+
+    snap = wave_service.snapshot(supervisor_id)
+    pending = wave_service.pop_pending_assign_drains()
+    if pending:
+        schedule_assign_drains(pending)
+    return snap
 
 
 @app.post("/terminals/{receiver_id}/inbox/messages")

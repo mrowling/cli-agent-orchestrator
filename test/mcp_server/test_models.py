@@ -72,3 +72,33 @@ class TestHandoffResult:
 
         assert result.duration_ms == 1234
         assert result.model_dump()["duration_ms"] == 1234
+
+    def test_handoff_result_done_sentinel_fields_optional(self):
+        """ADT-1: done_status/done_summary are nullable for backward compatibility."""
+        result = HandoffResult(
+            success=True,
+            message="Done",
+            output="Finished without sentinel",
+            terminal_id="term-002",
+        )
+
+        assert result.done_status is None
+        assert result.done_summary is None
+        data = result.model_dump()
+        assert data["done_status"] is None
+        assert data["done_summary"] is None
+
+    def test_handoff_result_done_cmd_fields_optional(self):
+        """ADT-3: done_cmd audit fields are nullable for backward compatibility."""
+        result = HandoffResult(
+            success=True,
+            message="Done",
+            output="Finished",
+            terminal_id="term-003",
+        )
+
+        assert result.done_cmd is None
+        assert result.done_cmd_exit is None
+        assert result.done_cmd_output is None
+        assert result.done_cmd_timed_out is None
+        assert result.done_cmd_error is None

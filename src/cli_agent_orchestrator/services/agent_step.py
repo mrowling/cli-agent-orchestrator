@@ -24,7 +24,7 @@ retry policy (FR-5.3); the HTTP handler maps it to an ``HTTPException``.
 import asyncio
 import logging
 import time
-from typing import Callable, Optional
+from typing import Any, Callable, Dict, Optional
 
 from cli_agent_orchestrator.models.terminal import AgentStepResult, TerminalStatus
 from cli_agent_orchestrator.plugins import PluginRegistry
@@ -52,6 +52,27 @@ DEFAULT_READY_TIMEOUT = 120.0
 # IDLE reads required before a post-input IDLE is accepted as "done" (issue #409a).
 _COMPLETION_POLL_INTERVAL = 1.0
 _IDLE_STABLE_POLLS = 3
+
+_WORKSPACE_SNAPSHOT_KEYS = (
+    "workspace_backend",
+    "workspace_path",
+    "workspace_branch",
+    "workspace_base_ref",
+)
+
+
+def _coerce_optional_str(value: Any) -> Optional[str]:
+    """Accept only real ``str | None``; reject MagicMock / arbitrary attrs."""
+    if value is None or isinstance(value, str):
+        return value
+    return None
+
+
+def _workspace_snapshot_from_terminal(terminal: Any) -> Dict[str, Optional[str]]:
+    """Extract nullable workspace fields without trusting mock auto-attrs."""
+    return {
+        key: _coerce_optional_str(getattr(terminal, key, None)) for key in _WORKSPACE_SNAPSHOT_KEYS
+    }
 
 
 class StepExecutionError(Exception):
@@ -214,6 +235,8 @@ async def run_agent_step(
     on_terminal_created: Optional[Callable[[str], None]] = None,
     cancel_event: Optional[asyncio.Event] = None,
     model: Optional[str] = None,
+    workspace: Optional[str] = None,
+    wave_reservation_id: Optional[str] = None,
 ) -> AgentStepResult:
     """Run one agent step and return its result (success only).
 
@@ -295,6 +318,10 @@ async def run_agent_step(
             a specific model for this one worker without a dedicated agent
             profile. Default None = behavior unchanged (profile.model, if
             any, still applies).
+        workspace: Optional workspace backend selection forwarded to
+            ``create_terminal`` (``auto|shared|worktree|rift``).
+        wave_reservation_id: Optional ADT-6 reservation bound server-side as
+            soon as the terminal is created (before ready-wait / input).
 
     Returns:
         ``AgentStepResult`` with status COMPLETED — ONLY on success.
@@ -310,6 +337,8 @@ async def run_agent_step(
     """
     created_here = reuse_terminal_id is None
     terminal_id = reuse_terminal_id
+    workspace_snapshot: dict = {}
+    cleanup_snapshot: dict = {}
 
     if created_here:
         # Inherit working directory from supervisor when not explicitly set.
@@ -362,8 +391,11 @@ async def run_agent_step(
             caller_id=caller_id,
             env_vars=env_vars,
             model=model,
+            workspace=workspace,
+            wave_reservation_id=wave_reservation_id,
         )
         terminal_id = terminal.id
+        workspace_snapshot = _workspace_snapshot_from_terminal(terminal)
 
         # BR-31: make the just-created terminal visible to U4's orphan sweep
         # BEFORE the readiness wait / input send — the dangerous edge is a
@@ -430,19 +462,33 @@ async def run_agent_step(
         terminal_service.get_output, terminal_id, OutputMode.LAST
     )
 
+    if teardown and created_here:
+        cleanup_snapshot = await _best_effort_teardown(terminal_id, registry) or {}
+
     result = AgentStepResult(
         terminal_id=terminal_id,
         last_message=last_message,
         status=TerminalStatus.COMPLETED,
+        workspace_backend=cleanup_snapshot.get("workspace_backend")
+        or workspace_snapshot.get("workspace_backend"),
+        workspace_path=cleanup_snapshot.get("workspace_path")
+        or workspace_snapshot.get("workspace_path"),
+        workspace_branch=cleanup_snapshot.get("workspace_branch")
+        or workspace_snapshot.get("workspace_branch"),
+        workspace_base_ref=cleanup_snapshot.get("workspace_base_ref")
+        or workspace_snapshot.get("workspace_base_ref"),
+        workspace_diff=cleanup_snapshot.get("workspace_diff"),
+        workspace_cleanup_status=cleanup_snapshot.get("workspace_cleanup_status"),
+        workspace_cleanup_message=cleanup_snapshot.get("workspace_cleanup_message"),
+        workspace_retained_branch=cleanup_snapshot.get("workspace_retained_branch"),
     )
-
-    if teardown and created_here:
-        await _best_effort_teardown(terminal_id, registry)
 
     return result
 
 
-async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegistry]) -> None:
+async def _best_effort_teardown(
+    terminal_id: str, registry: Optional[PluginRegistry]
+) -> Optional[Dict]:
     """Exit-then-delete a terminal this call created — best-effort (never raises).
 
     Mirrors the old handoff lifecycle: send the provider's graceful exit command
@@ -450,6 +496,10 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
     never turn a settled step (success OR cancellation) into a failure. Shared by
     the success teardown and the cancellation path (issue #409b) so a cancelled
     step reclaims its terminal exactly the way a successful one does.
+
+    Teardown seam is ``delete_terminal(...) -> bool`` (stable public contract).
+    Workspace cleanup metadata is read afterward via the read-only lifecycle
+    accessor — never by bypassing the seam with ``delete_terminal_with_result``.
     """
     try:
         # Graceful CLI shutdown before kill_window (e.g. "/exit" for Claude Code,
@@ -476,3 +526,14 @@ async def _best_effort_teardown(terminal_id: str, registry: Optional[PluginRegis
             terminal_id,
             exc,
         )
+        return None
+    try:
+        cleanup = await asyncio.to_thread(terminal_service.get_workspace_public_fields, terminal_id)
+    except Exception as exc:  # noqa: BLE001 — metadata is additive; never fail the step
+        logger.warning(
+            "run_agent_step: failed to load workspace lifecycle for %s after " "teardown: %s",
+            terminal_id,
+            exc,
+        )
+        return None
+    return cleanup if isinstance(cleanup, dict) else None

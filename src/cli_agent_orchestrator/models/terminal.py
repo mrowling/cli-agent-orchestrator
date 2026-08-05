@@ -38,6 +38,19 @@ class Terminal(BaseModel):
     shell_command: Optional[str] = Field(
         None, description="Shell process name captured before kiro launch"
     )
+    # D11 workspace isolation (nullable — shared default / pre-feature terminals).
+    workspace_backend: Optional[str] = Field(
+        None, description="Workspace backend used for this terminal (shared|worktree|rift)"
+    )
+    workspace_path: Optional[str] = Field(
+        None, description="Absolute workspace path when isolated (worker cwd)"
+    )
+    workspace_branch: Optional[str] = Field(
+        None, description="Isolated branch name when backend=worktree"
+    )
+    workspace_base_ref: Optional[str] = Field(
+        None, description="Committed git ref the workspace was created from"
+    )
     status: Optional[TerminalStatus] = Field(
         None, description="Current terminal status (live only)"
     )
@@ -58,3 +71,13 @@ class AgentStepResult(BaseModel):
     terminal_id: str
     last_message: str
     status: TerminalStatus
+    # D11: populated after teardown so handoff can report workspace/cleanup
+    # without depending on a live DB row.
+    workspace_backend: Optional[str] = None
+    workspace_path: Optional[str] = None
+    workspace_branch: Optional[str] = None
+    workspace_base_ref: Optional[str] = None
+    workspace_diff: Optional[str] = None
+    workspace_cleanup_status: Optional[str] = None
+    workspace_cleanup_message: Optional[str] = None
+    workspace_retained_branch: Optional[str] = None

@@ -16,6 +16,12 @@ from cli_agent_orchestrator.constants import (
     DEFAULT_PROVIDER,
     WORKFLOW_RUN_REQUEST_TIMEOUT,
 )
+from cli_agent_orchestrator.mcp_server import wave_client
+from cli_agent_orchestrator.mcp_server.done_cmd_verifier import (
+    DoneCmdVerification,
+    run_done_cmd,
+)
+from cli_agent_orchestrator.mcp_server.done_sentinel import parse_done_sentinel
 from cli_agent_orchestrator.mcp_server.models import HandoffResult
 from cli_agent_orchestrator.models.inbox import OrchestrationType
 from cli_agent_orchestrator.models.terminal import TerminalStatus
@@ -209,6 +215,8 @@ def _create_terminal(
     initial_message_orchestration_type: Optional[OrchestrationType] = None,
     model: Optional[str] = None,
     env_vars: Optional[Dict[str, str]] = None,
+    workspace: Optional[str] = None,
+    wave_reservation_id: Optional[str] = None,
 ) -> Tuple[str, str]:
     """Create a new terminal with the specified agent profile.
 
@@ -297,7 +305,7 @@ def _create_terminal(
         # prompt content isn't exposed in HTTP access logs and isn't subject to
         # URL-length limits. Only routing flags stay in params.
         json_body: Optional[Dict[str, Any]] = None
-        if defer_init or env_vars:
+        if defer_init or env_vars or workspace or wave_reservation_id:
             json_body = {}
             if defer_init:
                 params["defer_init"] = "true"
@@ -311,6 +319,10 @@ def _create_terminal(
                     )
             if env_vars:
                 json_body["env_vars"] = env_vars
+            if workspace:
+                json_body["workspace"] = workspace
+            if wave_reservation_id:
+                json_body["wave_reservation_id"] = wave_reservation_id
 
         response = requests.post(
             f"{API_BASE_URL}/sessions/{session_name}/terminals",
@@ -344,7 +356,7 @@ def _create_terminal(
             params["model"] = model
 
         json_body = None
-        if initial_message is not None or env_vars:
+        if initial_message is not None or env_vars or workspace:
             json_body = {}
             if initial_message is not None:
                 json_body["initial_message"] = initial_message
@@ -356,6 +368,8 @@ def _create_terminal(
                 )
             if env_vars:
                 json_body["env_vars"] = env_vars
+            if workspace:
+                json_body["workspace"] = workspace
 
         response = requests.post(
             f"{API_BASE_URL}/sessions",
@@ -736,10 +750,139 @@ def _load_skill_impl(name: str) -> Union[str, Dict[str, Any]]:
 
 
 # Implementation functions
+def _resolve_handoff_worker_cwd(
+    working_directory: Optional[str],
+    caller_id: Optional[str],
+) -> Optional[str]:
+    """Best-effort worker CWD for done_cmd — mirrors run_agent_step inheritance."""
+
+    if working_directory:
+        return working_directory
+    if not caller_id:
+        return None
+    try:
+        response = requests.get(
+            f"{API_BASE_URL}/terminals/{caller_id}/working-directory",
+            timeout=_mcp_timeout(),
+        )
+        if response.status_code == 200:
+            return response.json().get("working_directory")
+    except Exception as exc:
+        logger.warning(
+            "handoff done_cmd: failed to resolve worker cwd from caller %r: %s",
+            caller_id,
+            exc,
+        )
+    return None
+
+
 def _handoff_duration_ms(start_time: float) -> int:
     """D2: wall-clock duration of a blocking handoff in milliseconds."""
 
     return int((time.time() - start_time) * 1000)
+
+
+def _handoff_result_with_done_sentinel(
+    *,
+    success: bool,
+    message: str,
+    output: Optional[str],
+    terminal_id: Optional[str],
+    duration_ms: Optional[int],
+    verification: Optional[DoneCmdVerification] = None,
+    workspace_fields: Optional[Dict[str, Any]] = None,
+) -> HandoffResult:
+    """Build a HandoffResult with sentinel and optional done_cmd audit fields."""
+
+    done_status: Optional[str] = None
+    done_summary: Optional[str] = None
+    parsed = parse_done_sentinel(output)
+    if parsed is not None:
+        done_status = parsed.status
+        done_summary = parsed.summary
+
+    done_cmd_fields: dict[str, Any] = {}
+    if verification is not None:
+        done_cmd_fields = {
+            "done_cmd": verification.done_cmd,
+            "done_cmd_exit": verification.exit_code,
+            "done_cmd_output": verification.output,
+            "done_cmd_timed_out": verification.timed_out or None,
+            "done_cmd_error": verification.error,
+        }
+
+    ws = {
+        k: v
+        for k, v in (workspace_fields or {}).items()
+        if k.startswith("workspace_") and v is not None
+    }
+
+    return HandoffResult(
+        success=success,
+        message=message,
+        output=output,
+        terminal_id=terminal_id,
+        duration_ms=duration_ms,
+        done_status=done_status,
+        done_summary=done_summary,
+        **done_cmd_fields,
+        **ws,
+    )
+
+
+def _apply_done_cmd_verifier(
+    *,
+    result: HandoffResult,
+    done_cmd: Optional[str],
+    working_directory: Optional[str],
+    caller_id: Optional[str],
+) -> HandoffResult:
+    """Run optional done_cmd after capture; failure does not erase worker output."""
+
+    if not done_cmd:
+        return result
+
+    worker_cwd = _resolve_handoff_worker_cwd(working_directory, caller_id)
+    verification = run_done_cmd(done_cmd, cwd=worker_cwd)
+    workspace_fields = {
+        k: getattr(result, k)
+        for k in (
+            "workspace_backend",
+            "workspace_path",
+            "workspace_branch",
+            "workspace_base_ref",
+            "workspace_diff",
+            "workspace_cleanup_status",
+            "workspace_cleanup_message",
+            "workspace_retained_branch",
+        )
+        if getattr(result, k, None) is not None
+    }
+    enriched = _handoff_result_with_done_sentinel(
+        success=result.success,
+        message=result.message,
+        output=result.output,
+        terminal_id=result.terminal_id,
+        duration_ms=result.duration_ms,
+        verification=verification,
+        workspace_fields=workspace_fields,
+    )
+    if verification.accepted:
+        return enriched
+
+    detail = verification.error or f"exit code {verification.exit_code}"
+    sentinel_note = ""
+    if enriched.done_status is not None:
+        sentinel_note = (
+            f" (worker sentinel: status={enriched.done_status}"
+            f"{', summary=' + enriched.done_summary if enriched.done_summary else ''})"
+        )
+    return enriched.model_copy(
+        update={
+            "success": False,
+            "message": f"Handoff verifier failed: {detail}{sentinel_note}",
+        }
+    )
 
 
 def _record_handoff_step_duration(
@@ -779,6 +922,8 @@ async def _handoff_impl(
     timeout: int = 600,
     working_directory: Optional[str] = None,
     model: Optional[str] = None,
+    done_cmd: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> HandoffResult:
     """Implementation of handoff logic.
 
@@ -797,10 +942,16 @@ async def _handoff_impl(
     the already-shaped text to the substrate, which sends it verbatim. This is
     the one behavior-equivalence risk flagged in the plan; keeping the shaping
     caller-side is the choice that preserves the exact existing codex banner.
+
+    ADT-6: shares ``CAO_MAX_WAVE_IN_FLIGHT`` with assign. Excess handoffs wait
+    on an event-driven queue admission (no poll loop) before run-step.
     """
     start_time = time.time()
     terminal_id: Optional[str] = None
     provider = "unknown"
+    reservation_id: Optional[str] = None
+    queue_id: Optional[str] = None
+    wave_payload: Dict[str, Any] = {}
 
     try:
         # D6: reject before any create when child depth would reach the cap.
@@ -850,23 +1001,78 @@ async def _handoff_impl(
                 duration_ms=duration_ms,
             )
 
-        # Shape the prompt caller-side (prepends the codex [CAO Handoff] banner
-        # when provider == codex; otherwise returns the message unchanged).
+        supervisor_id = ctx.caller_id or _current_terminal_id()
         shaped_message = _shape_handoff_message(provider, message)
 
-        # Single combined call: create -> ready-wait -> input -> complete-wait ->
-        # extract -> teardown, all server-side via run_agent_step. session_name
-        # places the worker in the supervisor's session; caller_id/allowed_tools
-        # preserve #284 callback routing and tool inheritance.
-        # D6: inject CAO_AGENT_DEPTH (allowlisted) so the child MCP reads it.
+        wave_payload = {
+            "supervisor_id": supervisor_id,
+            "agent_profile": agent_profile,
+            "message": shaped_message,
+            "timeout": timeout,
+            "working_directory": working_directory,
+            "model": model,
+            "done_cmd": done_cmd,
+            "provider": provider,
+            "session_name": ctx.session_name,
+            "allowed_tools": ctx.allowed_tools,
+            "env_vars": {"CAO_AGENT_DEPTH": str(child_depth)},
+            "workspace": workspace,
+        }
+
+        # Overall deadline covering queue wait + run-step + global-cap rematch.
+        client_timeout_budget = float(timeout) + 180.0
+        deadline = start_time + client_timeout_budget
+
+        # ADT-6: admit or wait for a wave slot (shared with assign). Skip when
+        # there is no supervisor identity (no CAO_TERMINAL_ID / caller_id) —
+        # there is nothing to budget against; production supervisors always
+        # have CAO_TERMINAL_ID.
+        if supervisor_id:
+            admit = wave_client.try_admit(supervisor_id, "handoff", wave_payload)
+            if admit.get("status") == "queued":
+                queue_id = admit["queue_id"]
+                wait_timeout = max(0.1, deadline - time.time())
+                admit = wave_client.wait_for_admission(queue_id, timeout=wait_timeout)
+                if admit.get("status") in ("queued", "cancelled") or not admit.get(
+                    "reservation_id"
+                ):
+                    # wait_for_admission cancels on timeout; belt-and-suspenders cancel.
+                    if queue_id:
+                        try:
+                            wave_client.cancel_request(queue_id, reason="handoff wait timeout")
+                        except Exception:
+                            pass
+                        queue_id = None
+                    duration_ms = _handoff_duration_ms(start_time)
+                    return HandoffResult(
+                        success=False,
+                        message=(
+                            f"Handoff failed: timed out waiting for wave slot "
+                            f"(queue_id={admit.get('queue_id')}). {admit.get('message', '')}"
+                        ),
+                        output=None,
+                        terminal_id=None,
+                        duration_ms=duration_ms,
+                    )
+            reservation_id = admit.get("reservation_id")
+            queue_id = admit.get("queue_id") or queue_id
+
+        # When done_cmd is supplied, keep the worker terminal/worktree alive
+        # through capture so the verifier can run in the live cwd; tear down
+        # only after verifier success (preserve evidence on verifier failure).
+        # Omitted done_cmd keeps historical teardown=True behavior.
+        use_teardown = not bool(done_cmd and str(done_cmd).strip())
+
         payload: Dict[str, Any] = {
             "provider": provider,
             "agent": agent_profile,
             "prompt": shaped_message,
-            "teardown": True,
+            "teardown": use_teardown,
             "timeout": float(timeout),
             "env_vars": {"CAO_AGENT_DEPTH": str(child_depth)},
         }
+        if reservation_id:
+            payload["wave_reservation_id"] = reservation_id
         if ctx.session_name:
             payload["session_name"] = ctx.session_name
         if ctx.caller_id:
@@ -877,6 +1083,8 @@ async def _handoff_impl(
             payload["working_directory"] = working_directory
         if model:
             payload["model"] = model
+        if workspace:
+            payload["workspace"] = workspace
 
         try:
             from cli_agent_orchestrator.telemetry import record_spawn_depth
@@ -885,43 +1093,107 @@ async def _handoff_impl(
         except Exception:
             pass
 
-        # Allow the full step time plus the server-side ready-wait (up to 120s)
-        # plus headroom; the server enforces the per-step timeout internally.
-        client_timeout = float(timeout) + 180.0
-        try:
-            response = requests.post(
-                f"{API_BASE_URL}/terminals/run-step",
-                json=payload,
-                timeout=client_timeout,
-            )
-        except requests.Timeout:
-            duration_ms = _handoff_duration_ms(start_time)
-            _record_handoff_step_duration(
-                duration_ms,
-                provider=provider,
-                agent_profile=agent_profile,
-                model=model,
-                outcome="timeout",
-            )
-            return HandoffResult(
-                success=False,
-                message=f"Handoff timed out after {timeout} seconds",
-                output=None,
-                terminal_id=None,
-                duration_ms=duration_ms,
-            )
+        # Event-driven rematch: on global-cap 429, requeue at FIFO front and
+        # wait for the next capacity event (no busy poll) until the deadline.
+        response = None
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                if queue_id:
+                    try:
+                        wave_client.cancel_request(queue_id, reason="handoff deadline")
+                    except Exception:
+                        pass
+                    queue_id = None
+                duration_ms = _handoff_duration_ms(start_time)
+                _record_handoff_step_duration(
+                    duration_ms,
+                    provider=provider,
+                    agent_profile=agent_profile,
+                    model=model,
+                    outcome="timeout",
+                )
+                return HandoffResult(
+                    success=False,
+                    message=f"Handoff timed out after {timeout} seconds",
+                    output=None,
+                    terminal_id=None,
+                    duration_ms=duration_ms,
+                )
 
+            client_timeout = max(1.0, remaining)
+            if reservation_id:
+                payload["wave_reservation_id"] = reservation_id
+            try:
+                response = requests.post(
+                    f"{API_BASE_URL}/terminals/run-step",
+                    json=payload,
+                    timeout=client_timeout,
+                )
+            except requests.Timeout:
+                duration_ms = _handoff_duration_ms(start_time)
+                _record_handoff_step_duration(
+                    duration_ms,
+                    provider=provider,
+                    agent_profile=agent_profile,
+                    model=model,
+                    outcome="timeout",
+                )
+                return HandoffResult(
+                    success=False,
+                    message=f"Handoff timed out after {timeout} seconds",
+                    output=None,
+                    terminal_id=None,
+                    duration_ms=duration_ms,
+                )
+
+            if response.status_code == 429 and reservation_id:
+                # Global cap: requeue + rematch with a live waiter (no orphan).
+                try:
+                    requeued = wave_client.requeue_after_global_cap(
+                        reservation_id,
+                        kind="handoff",
+                        payload=wave_payload,
+                        queue_id=queue_id,
+                    )
+                    queue_id = requeued.get("queue_id") or queue_id
+                    reservation_id = None
+                except Exception as requeue_exc:
+                    logger.warning("Handoff global-cap requeue failed: %s", requeue_exc)
+                    break
+
+                wait_timeout = max(0.1, deadline - time.time())
+                if not queue_id:
+                    break
+                admit = wave_client.wait_for_admission(queue_id, timeout=wait_timeout)
+                if admit.get("status") in ("queued", "cancelled") or not admit.get(
+                    "reservation_id"
+                ):
+                    if queue_id:
+                        try:
+                            wave_client.cancel_request(queue_id, reason="handoff rematch timeout")
+                        except Exception:
+                            pass
+                        queue_id = None
+                    duration_ms = _handoff_duration_ms(start_time)
+                    return HandoffResult(
+                        success=False,
+                        message=(
+                            "Handoff failed: timed out waiting for terminal capacity "
+                            f"(CAO_MAX_ACTIVE_TERMINALS). {admit.get('message', '')}"
+                        ),
+                        output=None,
+                        terminal_id=None,
+                        duration_ms=duration_ms,
+                    )
+                reservation_id = admit.get("reservation_id")
+                continue
+
+            break
+
+        assert response is not None
         if response.status_code != 200:
-            # Map the boundary's HTTPException back into a HandoffResult. The
-            # run-step endpoint returns a STRUCTURED detail object
-            # ({message, kind, terminal_id}) so we read terminal_id and the
-            # failure kind as fields rather than scraping the message.
             kind, structured_detail, tid = _parse_run_step_error(response)
-            # worker RAN LONG (timeout) vs CRASHED (terminal reached ERROR) must
-            # be reported distinctly so a 5s crash is not mislabeled as an
-            # N-second timeout. The structured `kind` is authoritative; the
-            # status code is only the fallback when an older server omits it
-            # (504 -> timeout, 502 -> error).
             if kind == "error" or (kind is None and response.status_code == 502):
                 msg = f"Handoff failed: worker errored ({structured_detail})"
             elif kind == "timeout" or (kind is None and response.status_code == 504):
@@ -951,8 +1223,13 @@ async def _handoff_impl(
 
         data = response.json()
         terminal_id = data.get("terminal_id")
-        # A 200 must carry last_message; surface a malformed body as a failure
-        # rather than silently returning success-with-None.
+        # Binding is also done server-side via wave_reservation_id; keep a
+        # best-effort client bind for older servers / in-process tests.
+        if reservation_id and terminal_id:
+            try:
+                wave_client.bind_terminal(reservation_id, terminal_id)
+            except Exception as bind_exc:
+                logger.warning("Handoff wave bind failed: %s", bind_exc)
         if "last_message" not in data:
             duration_ms = _handoff_duration_ms(start_time)
             _record_handoff_step_duration(
@@ -971,6 +1248,21 @@ async def _handoff_impl(
             )
         output = data["last_message"]
 
+        workspace_fields = {
+            k: data.get(k)
+            for k in (
+                "workspace_backend",
+                "workspace_path",
+                "workspace_branch",
+                "workspace_base_ref",
+                "workspace_diff",
+                "workspace_cleanup_status",
+                "workspace_cleanup_message",
+                "workspace_retained_branch",
+            )
+            if data.get(k) is not None
+        }
+
         duration_ms = _handoff_duration_ms(start_time)
         _record_handoff_step_duration(
             duration_ms,
@@ -980,14 +1272,75 @@ async def _handoff_impl(
             outcome="success",
         )
         execution_time = duration_ms / 1000.0
-        return HandoffResult(
+        result = _handoff_result_with_done_sentinel(
             success=True,
             message=f"Successfully handed off to {agent_profile} ({provider}) in {execution_time:.2f}s"
             + _get_cleanup_nudge(),
             output=output,
             terminal_id=terminal_id,
             duration_ms=duration_ms,
+            workspace_fields=workspace_fields,
         )
+        # Prefer isolated workspace path for done_cmd when present (D12 cwd).
+        # With teardown=False the worktree still exists for the verifier.
+        verifier_cwd = workspace_fields.get("workspace_path") or working_directory
+        verified = _apply_done_cmd_verifier(
+            result=result,
+            done_cmd=done_cmd,
+            working_directory=verifier_cwd,
+            caller_id=ctx.caller_id,
+        )
+        if done_cmd and str(done_cmd).strip() and terminal_id:
+            if verified.success:
+                # Verifier passed — explicitly delete (runs worktree cleanup).
+                try:
+                    del_resp = requests.delete(
+                        f"{API_BASE_URL}/terminals/{terminal_id}",
+                        timeout=_mcp_timeout(),
+                    )
+                    delete_succeeded = False
+                    if del_resp.status_code == 200:
+                        try:
+                            body = del_resp.json() if del_resp.content else {}
+                        except Exception:
+                            body = None
+                        if isinstance(body, dict) and body.get("success") is True:
+                            delete_succeeded = True
+                            for key, value in body.items():
+                                if key.startswith("workspace_") and value is not None:
+                                    workspace_fields[key] = value
+                            verified = verified.model_copy(
+                                update={
+                                    k: v
+                                    for k, v in workspace_fields.items()
+                                    if hasattr(verified, k)
+                                }
+                            )
+                    if delete_succeeded:
+                        # Server delete_terminal released the bound wave slot;
+                        # clear reservation so finally skips release (avoid
+                        # double-release; unknown/idempotent release is a no-op).
+                        reservation_id = None
+                    # else: reservation_id stays set — finally owns best-effort
+                    # wave_client.release below.
+                except Exception as del_exc:
+                    logger.warning(
+                        "Handoff post-verifier delete failed for %s: %s",
+                        terminal_id,
+                        del_exc,
+                    )
+                    # reservation_id preserved — finally owns release.
+            else:
+                # Verifier failure: preserve evidence terminal/worktree for
+                # diagnostics. Wave slot is still released on handoff logical
+                # completion (finally below) — the global terminal cap continues
+                # to count the preserved terminal until explicit delete_terminal.
+                logger.info(
+                    "Handoff verifier failed; preserving terminal %s for diagnostics "
+                    "(wave slot still released on completion)",
+                    terminal_id,
+                )
+        return verified
 
     except Exception as e:
         # Surface terminal_id when known. With the single-call design the server
@@ -1008,6 +1361,21 @@ async def _handoff_impl(
             terminal_id=terminal_id,
             duration_ms=duration_ms,
         )
+    finally:
+        # ADT-6: handoff holds a slot until logical completion — release even when
+        # failure preserves diagnostic evidence (terminal may still exist; the
+        # global CAO_MAX_ACTIVE_TERMINALS cap still counts that preserved
+        # terminal until delete_terminal). Wave budget and global terminal cap
+        # are intentionally distinct.
+        if reservation_id:
+            try:
+                wave_client.release(reservation_id=reservation_id)
+            except Exception as release_exc:
+                logger.warning(
+                    "Handoff wave release failed for %s: %s",
+                    reservation_id,
+                    release_exc,
+                )
 
 
 # Shared by both handoff and assign's tool signatures below.
@@ -1018,6 +1386,14 @@ _model_field_desc = (
     "no dedicated profile is needed just to pin a specific model. Not honored by "
     "every provider (see the target provider's own docs); omit to use the agent "
     "profile's configured model as before."
+)
+_workspace_field_desc = (
+    "Optional workspace backend: auto|shared|worktree|rift (D11). Precedence: "
+    "this argument > CAO_WORKSPACE_BACKEND > shared (shipped default). "
+    "When launching >=2 parallel implementers, prefer workspace=worktree (or auto). "
+    "Worktree creates from a committed git ref only — dirty uncommitted source "
+    "state is not copied. Rift is deferred; auto skips it and probes worktree "
+    "then loud shared fallback. See docs/workspace-backends.md."
 )
 
 
@@ -1041,6 +1417,16 @@ if ENABLE_WORKING_DIRECTORY:
             description='Optional working directory where the agent should execute (e.g., "/path/to/workspace/src/Package")',
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        workspace: Optional[str] = Field(default=None, description=_workspace_field_desc),
+        done_cmd: Optional[str] = Field(
+            default=None,
+            description=(
+                "Optional shell-free verifier command (tokenized with shlex) run in "
+                "the worker's cwd after capture completes. Exit 0 accepts; non-zero, "
+                "timeout, or parse/spawn error fails handoff even when the worker "
+                "sentinel is ok. Omit for no behavior change."
+            ),
+        ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1053,16 +1439,23 @@ if ENABLE_WORKING_DIRECTORY:
         The tool will:
         1. Create a new terminal with the specified agent profile and provider
         2. Set the working directory for the terminal (defaults to supervisor's cwd)
-        3. Send the message to the terminal
-        4. Monitor until completion
-        5. Return the agent's response
-        6. Clean up the terminal with /exit
+        3. Optionally isolate via workspace backend (D11)
+        4. Send the message to the terminal
+        5. Monitor until completion
+        6. Return the agent's response (including workspace/cleanup metadata)
+        7. Clean up the terminal with /exit
 
         ## Working Directory
 
         - By default, agents start in the supervisor's current working directory
         - You can specify a custom directory via working_directory parameter
         - Directory must exist and be accessible
+
+        ## Workspace (D11)
+
+        - Default backend is shared (CAO_WORKSPACE_BACKEND / shipped default)
+        - Prefer workspace=worktree (or auto) when launching >=2 implementers
+        - Worktree uses a committed git ref only; dirty source state is not copied
 
         ## Model
 
@@ -1082,11 +1475,14 @@ if ENABLE_WORKING_DIRECTORY:
             timeout: Maximum wait time in seconds
             working_directory: Optional directory path where agent should execute
             model: Optional model override (not honored by every provider)
+            workspace: Optional workspace backend (auto|shared|worktree|rift)
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, working_directory, model)
+        return await _handoff_impl(
+            agent_profile, message, timeout, working_directory, model, done_cmd, workspace
+        )
 
 else:
 
@@ -1103,6 +1499,16 @@ else:
             le=3600,
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        workspace: Optional[str] = Field(default=None, description=_workspace_field_desc),
+        done_cmd: Optional[str] = Field(
+            default=None,
+            description=(
+                "Optional shell-free verifier command (tokenized with shlex) run in "
+                "the worker's cwd after capture completes. Exit 0 accepts; non-zero, "
+                "timeout, or parse/spawn error fails handoff even when the worker "
+                "sentinel is ok. Omit for no behavior change."
+            ),
+        ),
     ) -> HandoffResult:
         """Hand off a task to another agent via CAO terminal and wait for completion.
 
@@ -1114,10 +1520,17 @@ else:
         Use this tool to hand off tasks to another agent and wait for the results.
         The tool will:
         1. Create a new terminal with the specified agent profile and provider
-        2. Send the message to the terminal (starts in supervisor's current directory)
-        3. Monitor until completion
-        4. Return the agent's response
-        5. Clean up the terminal with /exit
+        2. Optionally isolate via workspace backend (D11)
+        3. Send the message to the terminal (starts in supervisor's current directory
+           unless workspace isolates)
+        4. Monitor until completion
+        5. Return the agent's response (including workspace/cleanup metadata)
+        6. Clean up the terminal with /exit
+
+        ## Workspace (D11)
+
+        - Default backend is shared (CAO_WORKSPACE_BACKEND / shipped default)
+        - Prefer workspace=worktree (or auto) when launching >=2 implementers
 
         ## Model
 
@@ -1135,11 +1548,14 @@ else:
             message: The task/message to send
             timeout: Maximum wait time in seconds
             model: Optional model override (not honored by every provider)
+            workspace: Optional workspace backend (auto|shared|worktree|rift)
 
         Returns:
             HandoffResult with success status, message, and agent output
         """
-        return await _handoff_impl(agent_profile, message, timeout, None, model)
+        return await _handoff_impl(
+            agent_profile, message, timeout, None, model, done_cmd, workspace
+        )
 
 
 # Implementation function for assign
@@ -1148,6 +1564,7 @@ def _assign_impl(
     message: str,
     working_directory: Optional[str] = None,
     model: Optional[str] = None,
+    workspace: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Implementation of assign logic.
 
@@ -1158,8 +1575,14 @@ def _assign_impl(
     under kiro-cli 2.11's ~60s per-tool client timeout, and lets multiple
     concurrent assigns from the same LLM turn run their init phases in
     parallel instead of blocking one behind the other.
+
+    ADT-6: shares ``CAO_MAX_WAVE_IN_FLIGHT`` with handoff. Excess assigns
+    return a queued receipt (side-table status ``queued``); cao-server
+    auto-starts them FIFO when a sibling is deleted or a handoff completes,
+    then inbox-notifies this supervisor with the new terminal_id.
     """
     terminal_id: Optional[str] = None
+    reservation_id: Optional[str] = None
     try:
         # D6: reject before any create when child depth would reach the cap.
         child_depth_or_err = _child_agent_depth_or_reject()
@@ -1205,6 +1628,66 @@ def _assign_impl(
         else:
             worker_message = message
 
+        # Resolve supervisor metadata so a queued assign can be auto-started
+        # later with the exact same options (provider/profile/model/cwd/depth).
+        meta_response = requests.get(
+            f"{API_BASE_URL}/terminals/{current_terminal_id}", timeout=_mcp_timeout()
+        )
+        meta_response.raise_for_status()
+        terminal_metadata = meta_response.json()
+        provider = resolve_provider(agent_profile, fallback_provider=terminal_metadata["provider"])
+        session_name = terminal_metadata["session_name"]
+        parent_allowed_tools = terminal_metadata.get("allowed_tools")
+        child_allowed_tools = _resolve_child_allowed_tools(parent_allowed_tools, agent_profile)
+        allowed_tools_list = child_allowed_tools.split(",") if child_allowed_tools else None
+
+        resolved_workdir = working_directory
+        if resolved_workdir is None:
+            try:
+                wd_resp = requests.get(
+                    f"{API_BASE_URL}/terminals/{current_terminal_id}/working-directory",
+                    timeout=_mcp_timeout(),
+                )
+                if wd_resp.status_code == 200:
+                    resolved_workdir = wd_resp.json().get("working_directory")
+            except Exception:
+                pass
+
+        wave_payload: Dict[str, Any] = {
+            "supervisor_id": current_terminal_id,
+            "agent_profile": agent_profile,
+            "message": worker_message,
+            "working_directory": resolved_workdir,
+            "model": model,
+            "provider": provider,
+            "session_name": session_name,
+            "allowed_tools": allowed_tools_list,
+            "env_vars": {"CAO_AGENT_DEPTH": str(child_depth)},
+            "initial_message_orchestration_type": OrchestrationType.ASSIGN.value,
+            "workspace": workspace,
+        }
+
+        admit = wave_client.try_admit(current_terminal_id, "assign", wave_payload)
+        if admit.get("status") == "queued":
+            queue_id = admit["queue_id"]
+            return {
+                "success": True,
+                "terminal_id": None,
+                "queue_id": queue_id,
+                "status": "queued",
+                "position": admit.get("position"),
+                "message": (
+                    f"Task queued for {agent_profile} (wave concurrency limit). "
+                    f"queue_id={queue_id}, position={admit.get('position')}. "
+                    f"It will start FIFO when a sibling assign is deleted or a "
+                    f"handoff completes; you will receive an inbox notification "
+                    f"with the new terminal_id. "
+                    f"Original message and options are preserved."
+                ),
+            }
+
+        reservation_id = admit.get("reservation_id")
+
         try:
             from cli_agent_orchestrator.telemetry import record_spawn_depth
 
@@ -1218,19 +1701,70 @@ def _assign_impl(
         # background task on the server. The tool-call typically returns
         # in under 2 seconds regardless of how long init takes.
         # D6: pass CAO_AGENT_DEPTH so the child's MCP process can gate further spawns.
-        terminal_id, _ = _create_terminal(
-            agent_profile,
-            working_directory,
-            defer_init=True,
-            initial_message=worker_message,
-            initial_message_orchestration_type=OrchestrationType.ASSIGN,
-            model=model,
-            env_vars={"CAO_AGENT_DEPTH": str(child_depth)},
-        )
+        try:
+            terminal_id, _ = _create_terminal(
+                agent_profile,
+                working_directory,
+                defer_init=True,
+                initial_message=worker_message,
+                initial_message_orchestration_type=OrchestrationType.ASSIGN,
+                model=model,
+                env_vars={"CAO_AGENT_DEPTH": str(child_depth)},
+                workspace=workspace,
+                wave_reservation_id=reservation_id,
+            )
+        except requests.HTTPError as create_exc:
+            # ADT-6 / D7: typed capacity detection via HTTP 429 (TerminalCapacityError).
+            status_code = (
+                create_exc.response.status_code if create_exc.response is not None else None
+            )
+            if status_code == 429 and reservation_id:
+                requeued = wave_client.requeue_after_global_cap(
+                    reservation_id,
+                    kind="assign",
+                    payload=wave_payload,
+                )
+                reservation_id = None
+                queue_id = requeued.get("queue_id")
+                return {
+                    "success": True,
+                    "terminal_id": None,
+                    "queue_id": queue_id,
+                    "status": "queued",
+                    "message": (
+                        f"Task queued for {agent_profile}: session at "
+                        f"CAO_MAX_ACTIVE_TERMINALS. queue_id={queue_id}. "
+                        f"Will start when a terminal is deleted (FIFO preserved)."
+                    ),
+                }
+            if reservation_id:
+                try:
+                    wave_client.release(reservation_id=reservation_id)
+                    reservation_id = None
+                except Exception:
+                    pass
+            raise
+        except Exception as create_exc:
+            # Non-HTTP failures: release the slot; do not string-match capacity.
+            if reservation_id:
+                try:
+                    wave_client.release(reservation_id=reservation_id)
+                    reservation_id = None
+                except Exception:
+                    pass
+            raise create_exc
 
-        return {
+        # Server-side bind at create is primary; client bind remains idempotent.
+        if reservation_id and terminal_id:
+            try:
+                wave_client.bind_terminal(reservation_id, terminal_id)
+            except Exception as bind_exc:
+                logger.warning("Assign wave bind failed: %s", bind_exc)
+
+        receipt: Dict[str, Any] = {
             "success": True,
             "terminal_id": terminal_id,
+            "status": "started",
             "message": (
                 f"Task assigned to {agent_profile} (terminal: {terminal_id}). "
                 f"Worker is initializing in the background; your task will be "
@@ -1239,11 +1773,31 @@ def _assign_impl(
                 + _get_cleanup_nudge()
             ),
         }
+        try:
+            meta = requests.get(f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout())
+            if meta.status_code == 200:
+                body = meta.json()
+                for key in (
+                    "workspace_backend",
+                    "workspace_path",
+                    "workspace_branch",
+                    "workspace_base_ref",
+                ):
+                    if body.get(key) is not None:
+                        receipt[key] = body[key]
+        except Exception:
+            pass
+        return receipt
 
     except Exception as e:
         # Surface the terminal_id when creation succeeded before the failure
         # (e.g. the send POST failed) so the orphaned terminal can be
         # inspected or deleted — matching the ready-timeout path above.
+        if reservation_id and not terminal_id:
+            try:
+                wave_client.release(reservation_id=reservation_id)
+            except Exception:
+                pass
         return {
             "success": False,
             "terminal_id": terminal_id,
@@ -1302,9 +1856,11 @@ Args:
 
     desc += """
     model: Optional model override for the worker (not honored by every provider)
+    workspace: Optional workspace backend (auto|shared|worktree|rift; D11). Prefer
+        worktree/auto when launching >=2 parallel implementers.
 
 Returns:
-    Dict with success status, worker terminal_id, and message"""
+    Dict with success status, worker terminal_id, message, and optional workspace fields"""
 
     return desc
 
@@ -1330,8 +1886,9 @@ if ENABLE_WORKING_DIRECTORY:
             default=None, description="Optional working directory where the agent should execute"
         ),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        workspace: Optional[str] = Field(default=None, description=_workspace_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, working_directory, model)
+        return _assign_impl(agent_profile, message, working_directory, model, workspace)
 
 else:
 
@@ -1342,8 +1899,9 @@ else:
         ),
         message: str = Field(description=_assign_message_field_desc),
         model: Optional[str] = Field(default=None, description=_model_field_desc),
+        workspace: Optional[str] = Field(default=None, description=_workspace_field_desc),
     ) -> Dict[str, Any]:
-        return _assign_impl(agent_profile, message, None, model)
+        return _assign_impl(agent_profile, message, None, model, workspace)
 
 
 # Implementation function for send_message
@@ -1561,7 +2119,23 @@ def delete_terminal(
             f"{API_BASE_URL}/terminals/{terminal_id}", timeout=_mcp_timeout()
         )
         response.raise_for_status()
-        return {"success": True, "message": f"Terminal {terminal_id} deleted successfully"}
+        body: Dict[str, Any] = {}
+        try:
+            body = response.json() if response.content else {}
+        except Exception:
+            body = {}
+        result: Dict[str, Any] = {
+            "success": True,
+            "message": f"Terminal {terminal_id} deleted successfully",
+        }
+        if isinstance(body, dict):
+            for key, value in body.items():
+                if key.startswith("workspace_") and value is not None:
+                    result[key] = value
+            if body.get("success") is False:
+                result["success"] = False
+                result["message"] = body.get("message") or result["message"]
+        return result
     except requests.HTTPError as e:
         if e.response is not None and e.response.status_code == 404:
             return {"success": False, "message": f"Terminal {terminal_id} not found"}

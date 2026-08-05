@@ -51,6 +51,7 @@ async def create_session(
     initial_message: str | None = None,
     initial_message_orchestration_type: OrchestrationType | None = None,
     model: str | None = None,
+    workspace: str | None = None,
 ) -> Terminal:
     """Create a new session by creating its initial terminal.
 
@@ -88,6 +89,7 @@ async def create_session(
         initial_message=initial_message,
         initial_message_orchestration_type=initial_message_orchestration_type,
         model=model,
+        workspace=workspace,
     )
     dispatch_plugin_event(
         registry,

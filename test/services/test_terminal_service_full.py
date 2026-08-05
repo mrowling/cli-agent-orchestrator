@@ -171,15 +171,18 @@ class TestCreateTerminal:
         result = await create_terminal("kiro_cli", "developer", new_session=True)
 
         assert result.allowed_tools == ["fs_read"]
-        mock_db_create.assert_called_once_with(
+        mock_db_create.assert_called_once()
+        args, kwargs = mock_db_create.call_args
+        assert args[:6] == (
             "test1234",
             "cao-session",
             "developer-abcd",
             "kiro_cli",
             "developer",
             ["fs_read"],
-            caller_id=None,
         )
+        assert kwargs.get("caller_id") is None
+        assert kwargs.get("workspace_json")  # D11 shared workspace meta persisted
         assert mock_provider_manager.create_provider.call_args.args[5] == ["fs_read"]
 
     @pytest.mark.asyncio
