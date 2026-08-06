@@ -1063,6 +1063,53 @@ def get_terminal(terminal_id: str) -> Dict:
         raise
 
 
+def get_context_usage(terminal_id: str) -> Dict:
+    """Return scraped context-window usage for a terminal (observe only).
+
+    Reads the StatusMonitor rolling buffer and asks the live provider's
+    :meth:`~cli_agent_orchestrator.providers.base.BaseProvider.get_context_usage`.
+    Unsupported providers or missing footers yield ``ratio=None`` and
+    ``source="unknown"``.
+
+    Raises:
+        ValueError: If the terminal does not exist.
+    """
+    metadata = get_terminal_metadata(terminal_id)
+    if not metadata:
+        raise ValueError(f"Terminal '{terminal_id}' not found")
+
+    provider_name = metadata.get("provider") or "unknown"
+    buffer = status_monitor.get_buffer(terminal_id)
+    provider = provider_manager.get_provider(terminal_id)
+    ratio = None
+    if provider is not None:
+        try:
+            ratio = provider.get_context_usage(buffer)
+        except Exception as e:
+            logger.warning(
+                "get_context_usage failed for terminal %s (%s): %s",
+                terminal_id,
+                provider_name,
+                e,
+            )
+            ratio = None
+
+    if ratio is not None:
+        try:
+            ratio = float(ratio)
+        except (TypeError, ValueError):
+            ratio = None
+        if ratio is not None and not (0.0 <= ratio <= 1.0):
+            ratio = max(0.0, min(1.0, ratio))
+
+    return {
+        "terminal_id": terminal_id,
+        "ratio": ratio,
+        "source": "screen" if ratio is not None else "unknown",
+        "provider": provider_name,
+    }
+
+
 def get_working_directory(terminal_id: str) -> Optional[str]:
     """Get the current working directory of a terminal's pane.
 

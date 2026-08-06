@@ -82,7 +82,11 @@ from cli_agent_orchestrator.models.memory import (
     MemoryScopeId,
     MemoryType,
 )
-from cli_agent_orchestrator.models.terminal import Terminal, TerminalId
+from cli_agent_orchestrator.models.terminal import (
+    ContextUsageResponse,
+    Terminal,
+    TerminalId,
+)
 from cli_agent_orchestrator.plugins import PluginRegistry
 from cli_agent_orchestrator.security.auth import (
     SCOPE_ADMIN,
@@ -2394,6 +2398,27 @@ async def get_terminal_working_directory(terminal_id: TerminalId) -> WorkingDire
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to get working directory: {str(e)}",
+        )
+
+
+@app.get("/terminals/{terminal_id}/context-usage", response_model=ContextUsageResponse)
+async def get_terminal_context_usage(terminal_id: TerminalId) -> ContextUsageResponse:
+    """Return scraped provider context-window usage for a terminal (observe only).
+
+    Parses the StatusMonitor rolling buffer via the provider adapter's footer
+    scrape (e.g. Cursor status-bar ``13.2%``, Kimi ``context: N%``). Returns
+    ``ratio=null`` and ``source=unknown`` when the provider cannot report
+    usage or the footer is not visible. CAO does not autocompact.
+    """
+    try:
+        result = await asyncio.to_thread(terminal_service.get_context_usage, terminal_id)
+        return ContextUsageResponse(**result)
+    except ValueError as e:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(e))
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get context usage: {str(e)}",
         )
 
 

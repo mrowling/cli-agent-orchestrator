@@ -740,10 +740,10 @@ class TestBuildCommand:
     def test_mcp_servers_forwarded_via_plugin_dir(self, mock_load):
         # v2026 removed ``--mcp <json>``. The replacement is
         # ``--plugin-dir <path>`` pointing at a directory holding a
-        # plugin manifest. We synthesise that directory at build
-        # time; the test asserts the flag is present, points at an
-        # existing directory, and that the manifest's mcpServers
-        # map carries CAO_TERMINAL_ID.
+        # real Cursor plugin (marketplace layout). We synthesise that
+        # directory at build time; the test asserts the flag is present,
+        # points at an existing directory, and that mcp.json's
+        # mcpServers map carries CAO_TERMINAL_ID.
         import json
         from pathlib import Path
 
@@ -761,14 +761,22 @@ class TestBuildCommand:
         assert m is not None, f"--plugin-dir <path> not found in: {cmd}"
         plugin_dir = Path(m.group(1))
         assert plugin_dir.is_dir()
-        # The synthesised manifest must include the server with the
+        # Marketplace layout: metadata under .cursor-plugin/, servers in mcp.json
+        meta_path = plugin_dir / ".cursor-plugin" / "plugin.json"
+        assert meta_path.is_file()
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+        assert meta["name"] == "cao-session-test-tid"
+        # The synthesised mcp.json must include the server with the
         # terminal id forwarded into its env.
-        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
-        servers = manifest["mcpServers"]
-        assert "cao-mcp-server" in servers
-        assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
-        # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
-        assert servers["cao-mcp-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
+        for name in ("mcp.json", ".mcp.json"):
+            manifest = json.loads((plugin_dir / name).read_text(encoding="utf-8"))
+            servers = manifest["mcpServers"]
+            assert "cao-mcp-server" in servers
+            assert servers["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "test-tid"
+            # D6: spawn depth forwarded into MCP env (absent ⇒ "0").
+            assert servers["cao-mcp-server"]["env"]["CAO_AGENT_DEPTH"] == "0"
+        # Legacy invalid root plugin.json must not be written.
+        assert not (plugin_dir / "plugin.json").exists()
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
     def test_mcp_resolves_bundled_command_in_manifest(self, mock_load):
@@ -799,7 +807,7 @@ class TestBuildCommand:
             cmd = provider._build_cursor_command()
         m = re.search(r"--plugin-dir\s+(\S+)", cmd)
         assert m is not None
-        manifest = json.loads((Path(m.group(1)) / "plugin.json").read_text(encoding="utf-8"))
+        manifest = json.loads((Path(m.group(1)) / "mcp.json").read_text(encoding="utf-8"))
         assert manifest["mcpServers"]["cao-mcp-server"]["command"] == "/venv/bin/cao-mcp-server"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
@@ -825,7 +833,7 @@ class TestBuildCommand:
         m = re.search(r"--plugin-dir\s+(\S+)", cmd)
         assert m is not None
         plugin_dir = Path(m.group(1))
-        manifest = json.loads((plugin_dir / "plugin.json").read_text(encoding="utf-8"))
+        manifest = json.loads((plugin_dir / "mcp.json").read_text(encoding="utf-8"))
         assert manifest["mcpServers"]["cao-mcp-server"]["env"]["CAO_TERMINAL_ID"] == "preset"
 
     @patch("cli_agent_orchestrator.providers.cursor_cli.load_agent_profile")
@@ -1256,6 +1264,54 @@ class TestWaitUntilInputReady:
 
 
 # ---------------------------------------------------------------------------
+# Context-usage scraping (status-bar %)
+# ---------------------------------------------------------------------------
+
+
+class TestGetContextUsage:
+    def test_status_bar_percent_with_run_everything(self):
+        output = (
+            "  Add a follow-up\n"
+            "  GPT-5.6 Sol 272K Extra High · 13.2% · 28 files edited"
+            "                                             Run Everything\n"
+        )
+        assert make_provider().get_context_usage(output) == pytest.approx(0.132)
+
+    def test_status_bar_percent_while_processing(self):
+        output = (
+            "  Add a follow-up  ctrl+c to stop\n"
+            "  GPT-5.6 Sol 272K Extra High · 13.2% · 28 files edited"
+            "                                             Run Everything\n"
+        )
+        assert make_provider().get_context_usage(output) == pytest.approx(0.132)
+
+    def test_files_edited_anchor_without_run_everything(self):
+        output = "Composer 2.5 Fast · 4.0% · 1 files edited\n"
+        assert make_provider().get_context_usage(output) == pytest.approx(0.04)
+
+    def test_prose_percent_without_status_chrome_is_none(self):
+        output = (
+            "The tests pass 100% of the time now.\n"
+            "Coverage is at 95% overall.\n"
+        )
+        assert make_provider().get_context_usage(output) is None
+
+    def test_empty_buffer_is_none(self):
+        assert make_provider().get_context_usage("") is None
+
+    def test_hundred_percent_clamps(self):
+        output = "Model · 100% · 0 files edited  Run Everything\n"
+        assert make_provider().get_context_usage(output) == pytest.approx(1.0)
+
+    def test_ansi_escapes_stripped(self):
+        output = (
+            "  \x1b[2mGPT-5.6 Sol\x1b[0m · \x1b[1m13.2%\x1b[0m · 28 files edited"
+            "  \x1b[35mRun Everything\x1b[39m\n"
+        )
+        assert make_provider().get_context_usage(output) == pytest.approx(0.132)
+
+
+# ---------------------------------------------------------------------------
 # Misc interface methods
 # ---------------------------------------------------------------------------
 
@@ -1287,7 +1343,11 @@ class TestMiscInterface:
         prompt_path.write_text("dummy")
         plugin_dir = tmp_path / f"{provider.terminal_id}-cursor-plugins"
         plugin_dir.mkdir()
-        (plugin_dir / "plugin.json").write_text("{}")
+        meta_dir = plugin_dir / ".cursor-plugin"
+        meta_dir.mkdir()
+        (meta_dir / "plugin.json").write_text('{"name":"cao-session-test"}')
+        (plugin_dir / "mcp.json").write_text('{"mcpServers":{}}')
+        (plugin_dir / ".mcp.json").write_text('{"mcpServers":{}}')
         provider._tmp_paths = [prompt_path, plugin_dir]
         # Sanity: the files are there before cleanup.
         assert prompt_path.exists()

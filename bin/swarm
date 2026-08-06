@@ -374,7 +374,10 @@ model_for() {
   model="$(field_for "$piece" model)"
   case "$piece" in
     king|orchestrator|queen) model="${model:-claude-opus-4.8-thinking-high}" ;;
-    king_cursor|orchestrator_cursor|queen_cursor)
+    king_cursor)
+      model="${model:-gpt-5.6-sol-xhigh}"
+      ;;
+    orchestrator_cursor|queen_cursor)
       model="${model:-claude-opus-4.8-thinking-high}"
       ;;
     king_oc|orchestrator_oc|queen_oc)
@@ -388,7 +391,7 @@ model_for() {
 blurb_for() {
   case "$1" in
     king) echo "scoped fleet supervisor for this directory" ;;
-    king_cursor) echo "king on Cursor (Opus 4.8 high)" ;;
+    king_cursor) echo "king on Cursor (Sol 5.6 xhigh)" ;;
     king_oc) echo "king on OpenCode (Opus 4.8 high)" ;;
     orchestrator) echo "pure decompose + delegate via assign/handoff" ;;
     orchestrator_cursor) echo "orchestrator on Cursor (Opus 4.8 high)" ;;

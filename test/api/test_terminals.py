@@ -66,6 +66,63 @@ class TestWorkingDirectoryEndpoint:
             assert "Failed to get working directory" in response.json()["detail"]
 
 
+class TestContextUsageEndpoint:
+    """Test GET /terminals/{terminal_id}/context-usage endpoint."""
+
+    def test_get_context_usage_success(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_context_usage.return_value = {
+                "terminal_id": "abcd1234",
+                "ratio": 0.132,
+                "source": "screen",
+                "provider": "cursor_cli",
+            }
+
+            response = client.get("/terminals/abcd1234/context-usage")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["terminal_id"] == "abcd1234"
+            assert data["ratio"] == pytest.approx(0.132)
+            assert data["source"] == "screen"
+            assert data["provider"] == "cursor_cli"
+            mock_svc.get_context_usage.assert_called_once_with("abcd1234")
+
+    def test_get_context_usage_unknown(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_context_usage.return_value = {
+                "terminal_id": "abcd1234",
+                "ratio": None,
+                "source": "unknown",
+                "provider": "claude_code",
+            }
+
+            response = client.get("/terminals/abcd1234/context-usage")
+
+            assert response.status_code == 200
+            data = response.json()
+            assert data["ratio"] is None
+            assert data["source"] == "unknown"
+
+    def test_get_context_usage_not_found(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_context_usage.side_effect = ValueError("Terminal 'abcd5678' not found")
+
+            response = client.get("/terminals/abcd5678/context-usage")
+
+            assert response.status_code == 404
+            assert "not found" in response.json()["detail"].lower()
+
+    def test_get_context_usage_server_error(self, client):
+        with patch("cli_agent_orchestrator.api.main.terminal_service") as mock_svc:
+            mock_svc.get_context_usage.side_effect = Exception("boom")
+
+            response = client.get("/terminals/abcd1234/context-usage")
+
+            assert response.status_code == 500
+            assert "Failed to get context usage" in response.json()["detail"]
+
+
 class TestSessionCreationWithWorkingDirectory:
     """Test session creation with working_directory parameter."""
 

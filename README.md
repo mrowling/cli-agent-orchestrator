@@ -16,6 +16,22 @@ sessions, and gives a supervisor tools for coordinating workers. The agents
 remain full CLI processes with their native authentication and capabilities.
 See [CODEBASE.md](CODEBASE.md) for the runtime architecture and package layout.
 
+## Features
+
+Beyond single-supervisor handoffs, this tree includes fleet-oriented
+capabilities for hierarchical multi-agent runs:
+
+| Area | What you get |
+| --- | --- |
+| **Chess-piece fleets** | Hierarchical profiles (king → queen → bishop / knight / rook / pawn + orchestrator), with Claude Code, Cursor, and OpenCode supervisor variants. Coordinate via `cao-mcp-server` only. See [chess-pieces](examples/chess-pieces/README.md). |
+| **Swarm launcher** | `bin/swarm` — fzf CLI to start/stop `cao-server`, open the Web UI, bootstrap `.swarm/` policy templates + beads issue tracking, and launch installed piece profiles. |
+| **Honest completion** | `===CAO_DONE===` sentinels so handoffs distinguish task completion from turn idle, plus optional shell-free `done_cmd` acceptance checks. |
+| **Wave concurrency** | Per-supervisor FIFO queue capped by `CAO_MAX_WAVE_IN_FLIGHT`; drains on child complete or delete without busy-polling. |
+| **Workspace isolation** | Shared cwd (default) or git **worktree** backends for parallel workers. See [workspace backends](docs/workspace-backends.md). |
+| **Doorbell** | Short external triggers (`[source:type:id]`) to the king over the inbox path — watchers ring the bell; no auto-spawn. See [doorbell](docs/doorbell.md). |
+| **Swarm observability** | Fleet bounds (depth / terminal admission / fail-closed roles), step-timing + handoff duration, stacked reviewer profiles, and opt-in OpenTelemetry metrics/spans. See [OTel deployment](docs/otel-deployment.md). |
+| **Web Profiles tab** | Browse installed agent profiles and inspect each parsed manifest from the [Web UI](docs/web-ui.md). |
+
 ## Prerequisites
 
 Install:
@@ -95,6 +111,26 @@ provider override while keeping the same sequence.
 
    To stop every CAO session instead, run `cao shutdown --all`.
 
+## Chess-piece swarm (optional)
+
+For a multi-agent chess hierarchy in the current project directory:
+
+```bash
+# Install piece profiles (Claude Code / Cursor / OpenCode variants included)
+for f in examples/chess-pieces/*.md; do
+  [[ "$(basename "$f")" == "README.md" ]] && continue
+  cao install "$f"
+done
+
+export PATH="$PWD/bin:$PATH"
+swarm init          # requires bd on PATH; creates .beads/ + .swarm/ if missing
+swarm start         # cao-server if needed
+swarm launch king   # or king_cursor / king_oc / orchestrator / …
+```
+
+Full role table, wave caps, worktrees, doorbell, and completion rules:
+[examples/chess-pieces/README.md](examples/chess-pieces/README.md).
+
 ## Where to go next
 
 ### Operate CAO
@@ -102,7 +138,10 @@ provider override while keeping the same sequence.
 - [Control-plane selection](docs/control-planes.md): choose the Web UI, shell
   CLI, operations MCP server, or plugins.
 - [Web UI](docs/web-ui.md) and [MCP Apps](docs/mcp-apps.md): browser and
-  host-rendered fleet interfaces.
+  host-rendered fleet interfaces (including the Profiles tab).
+- [Chess-piece fleets](examples/chess-pieces/README.md): hierarchical agent
+  profiles and the `swarm` launcher.
+- [Doorbell](docs/doorbell.md): external short-form triggers to the king.
 - [Flows](docs/flows.md) and [workflows](docs/workflows.md): scheduled runs and
   multi-step pipelines.
 - [Skills](docs/skills.md): install, scope, and author reusable agent guidance.
@@ -113,7 +152,9 @@ provider override while keeping the same sequence.
   provider enforcement.
 - [Working directory](docs/working-directory.md) and
   [workspace backends](docs/workspace-backends.md): cwd parameter vs
-  per-worker isolation (`shared` / `worktree` / `auto`; D11).
+  per-worker isolation (`shared` / `worktree` / `auto`).
+- [OpenTelemetry](docs/otel-deployment.md): opt-in OTLP spans and swarm-health
+  metrics (disabled unless `OTEL_SDK_DISABLED=false`).
 - [Updating CAO](docs/updating.md): update an installed uv tool.
 
 ### Configure and integrate

@@ -7,7 +7,7 @@ description: >-
   queen for architecture.
 role: supervisor
 provider: cursor_cli
-model: claude-opus-4.8-thinking-high
+model: gpt-5.6-sol-xhigh
 tags:
   - orchestration
   - supervisor
@@ -208,6 +208,25 @@ Workers emit sentinels only; **you** run `bd` and write receipts **serially**
 | High-stakes red-team review | `rook-adversarial` |
 
 Operate at the **lowest** level capable of the task. Do not over-assign.
+
+## Maintain lean context
+
+You are long-lived; protect your context window. CAO does not auto-compact this
+session — lean context is your job.
+
+1. **Prefer summaries over bulk** — Rely on `HandoffResult.done_status` /
+   `done_summary` (or the `===CAO_DONE===` one-liner). Do not re-ingest raw
+   handoff `output`, tool dumps, diffs, or CI logs.
+2. **Delegate discovery and dumps** — Large scans and log reading go to a `pawn`
+   (or other piece) that returns a structured summary only.
+3. **Park progress outside the chat** — Write receipts to bd; append conclusions
+   (not transcripts) to `.swarm/LEARNINGS.md`; keep `memory_store` to 1–2
+   sentences. Resume from POLICY / LEARNINGS / state / `bd ready`, not a
+   swollen transcript.
+4. **Tear down workers** — Prefer `handoff`; after `assign`, `delete_terminal`
+   immediately (see Lifecycle). Never reuse a finished subpiece.
+5. **Short triggers only** — Act on doorbells as ≤200-char pointers; never pull
+   full webhook or CI payloads into this session.
 
 ## When invoked
 

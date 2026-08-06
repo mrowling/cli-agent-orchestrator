@@ -57,6 +57,27 @@ class Terminal(BaseModel):
     last_active: Optional[datetime] = Field(None, description="Last active timestamp")
 
 
+class ContextUsageResponse(BaseModel):
+    """Provider context-window usage scraped from the terminal TUI footer.
+
+    Observe-only: CAO does not autocompact. ``ratio`` is ``None`` when the
+    provider cannot report usage (unsupported adapter or footer not visible).
+    """
+
+    terminal_id: str = Field(..., description="Terminal identifier")
+    ratio: Optional[float] = Field(
+        None,
+        description="Context window fraction used (0.0–1.0), or null if unknown",
+        ge=0.0,
+        le=1.0,
+    )
+    source: str = Field(
+        ...,
+        description='Where the ratio came from: "screen" when parsed from the TUI, else "unknown"',
+    )
+    provider: str = Field(..., description="Provider type for this terminal")
+
+
 class AgentStepResult(BaseModel):
     """Transient result of one agent step (issue #312, C3b). Not persisted.
 

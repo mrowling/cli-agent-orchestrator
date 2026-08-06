@@ -135,6 +135,11 @@ STATUS_BAR_PATTERN = r"\d+:\d+\s+.*(?:agent|shell)\s*\("
 # Either of these confirms the new TUI is up at its prompt: the context-usage
 # footer, or the status bar's "agent (<model> ●)" segment (● = U+25CF).
 NEW_TUI_STATUS_PATTERN = r"context:\s*\d+(?:\.\d+)?%|agent\s*\([^)]*●"
+# Explicit capture for get_context_usage — "context: 12.3% (n/Nk)" or bare %.
+CONTEXT_USAGE_PATTERN = re.compile(
+    r"context:\s*(\d+(?:\.\d+)?)\s*%",
+    re.IGNORECASE,
+)
 # Live working indicator: the new TUI animates a braille spinner
 # ("⠧ Thinking… 5s · 220 tokens", "⠹ Using handoff({...})") and a moon-phase
 # thinking glyph (🌑…🌘) that are cleared when the turn finishes. Any such
@@ -839,6 +844,30 @@ class KimiCliProvider(BaseProvider):
         # absence of all TUI chrome means we are NOT looking at an active Kimi
         # turn — so report UNKNOWN rather than a false PROCESSING.
         return TerminalStatus.UNKNOWN
+
+    def get_context_usage(self, buffer: str) -> Optional[float]:
+        """Parse context-window usage from the Kimi status footer.
+
+        Matches ``context: 12.3%`` (optionally followed by ``(n/Nk)``).
+        Returns a ratio in ``[0.0, 1.0]`` when found, else ``None``.
+        """
+        if not buffer:
+            return None
+        buffer = self._resolve_buffer(buffer)
+        if not buffer:
+            return None
+        clean = strip_terminal_escapes(buffer)
+        # Prefer the last match in case an older footer scrolled up.
+        matches = list(CONTEXT_USAGE_PATTERN.finditer(clean))
+        if not matches:
+            return None
+        try:
+            pct = float(matches[-1].group(1))
+        except ValueError:
+            return None
+        if pct < 0.0:
+            return None
+        return min(pct / 100.0, 1.0)
 
     def extract_last_message_from_script(self, script_output: str) -> str:
         """Extract Kimi's final response from terminal output.

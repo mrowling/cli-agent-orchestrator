@@ -7,7 +7,7 @@ Orchestrator.
 | Profile | Rank | CAO role | Default provider | Model | Use for |
 | --- | --- | --- | --- | --- | --- |
 | `king` | ♚ | `supervisor` | `claude_code` | `claude-opus-4.8-thinking-high` | Plan, discover, delegate — never code or review |
-| `king_cursor` | ♚ | `supervisor` | `cursor_cli` | `claude-opus-4.8-thinking-high` | Same as `king`, on Cursor |
+| `king_cursor` | ♚ | `supervisor` | `cursor_cli` | `gpt-5.6-sol-xhigh` | Same as `king`, on Cursor |
 | `king_oc` | ♚ | `supervisor` | `opencode_cli` | `anthropic/claude-opus-4.8-thinking-high` | Same as `king`, on OpenCode |
 | `orchestrator` | — | `supervisor` | `claude_code` | `claude-opus-4.8-thinking-high` | Aggressive decompose-and-delegate only |
 | `orchestrator_cursor` | — | `supervisor` | `cursor_cli` | `claude-opus-4.8-thinking-high` | Same as `orchestrator`, on Cursor |
@@ -150,6 +150,21 @@ The king / orchestrator session is **long-lived**. Subpieces it spawns via
 `assign` / `handoff` (profile names match the table above) are **ephemeral**:
 prefer `handoff` (auto-teardown), and after `assign` call `delete_terminal` as
 soon as the result lands — do not keep one bishop/rook/etc alive and reuse it.
+
+### Context hygiene (kings)
+
+CAO does **not** auto-compact king chat history. Keep the king pane lean:
+
+- Prefer `done_summary` / the `===CAO_DONE===` one-liner over raw handoff `output`.
+- Park progress in **bd** and thin append to `.swarm/LEARNINGS.md`; resume from
+  POLICY / LEARNINGS / `state.json` / `bd ready`, not a swollen transcript.
+- Push log dumps and large scans to a one-shot `pawn` (structured summary only).
+- Doorbells stay ≤200 chars (pointers only — see above).
+- If the provider pane still swells, flush state, then use the **provider’s**
+  compact/new-session; rehydrate from `.swarm` + bd.
+
+Re-install king profiles after pulling changes so lean-context rules are live in
+the agent-store: `cao install examples/chess-pieces/king*.md`.
 
 ## Done sentinel
 

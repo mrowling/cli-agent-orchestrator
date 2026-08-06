@@ -185,6 +185,26 @@ class BaseProvider(ABC):
         """
         return self.get_status("\n".join(screen_lines))
 
+    def get_context_usage(self, buffer: str) -> Optional[float]:
+        """Fraction of the provider's context window in use, or None if unknown.
+
+        Range is ``0.0``–``1.0`` when known (e.g. a TUI footer ``13.2%`` →
+        ``0.132``). Default is ``None`` — adapters that can scrape a stable
+        usage signal from the StatusMonitor pipe-pane buffer override this.
+        Implementations must not invent estimates from byte length or
+        ``len // 4`` token heuristics.
+
+        Args:
+            buffer: Raw terminal output (same rolling buffer contract as
+                :meth:`get_status`). May be empty when StatusMonitor has not
+                yet accumulated bytes for the terminal.
+
+        Returns:
+            Usage ratio in ``[0.0, 1.0]``, or ``None`` if the provider cannot
+            read context usage from ``buffer``.
+        """
+        return None
+
     @property
     def paste_submit_delay(self) -> float:
         """Seconds to wait after a bracketed paste before sending the Enter key.

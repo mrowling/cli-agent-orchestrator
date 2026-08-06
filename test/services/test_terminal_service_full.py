@@ -1153,6 +1153,78 @@ class TestGetWorkingDirectory:
             get_working_directory("nonexistent")
 
 
+class TestGetContextUsage:
+    """Tests for get_context_usage service helper."""
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_screen_ratio(self, mock_get_metadata, mock_status_monitor, mock_pm):
+        mock_get_metadata.return_value = {
+            "id": "abcd1234",
+            "provider": "cursor_cli",
+        }
+        mock_status_monitor.get_buffer.return_value = "status buffer"
+        provider = MagicMock()
+        provider.get_context_usage.return_value = 0.132
+        mock_pm.get_provider.return_value = provider
+
+        from cli_agent_orchestrator.services.terminal_service import get_context_usage
+
+        result = get_context_usage("abcd1234")
+
+        assert result == {
+            "terminal_id": "abcd1234",
+            "ratio": 0.132,
+            "source": "screen",
+            "provider": "cursor_cli",
+        }
+        provider.get_context_usage.assert_called_once_with("status buffer")
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_unknown_when_provider_returns_none(
+        self, mock_get_metadata, mock_status_monitor, mock_pm
+    ):
+        mock_get_metadata.return_value = {"id": "abcd1234", "provider": "claude_code"}
+        mock_status_monitor.get_buffer.return_value = ""
+        provider = MagicMock()
+        provider.get_context_usage.return_value = None
+        mock_pm.get_provider.return_value = provider
+
+        from cli_agent_orchestrator.services.terminal_service import get_context_usage
+
+        result = get_context_usage("abcd1234")
+        assert result["ratio"] is None
+        assert result["source"] == "unknown"
+        assert result["provider"] == "claude_code"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.provider_manager")
+    @patch("cli_agent_orchestrator.services.terminal_service.status_monitor")
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_unknown_when_no_live_provider(
+        self, mock_get_metadata, mock_status_monitor, mock_pm
+    ):
+        mock_get_metadata.return_value = {"id": "abcd1234", "provider": "cursor_cli"}
+        mock_status_monitor.get_buffer.return_value = "whatever"
+        mock_pm.get_provider.return_value = None
+
+        from cli_agent_orchestrator.services.terminal_service import get_context_usage
+
+        result = get_context_usage("abcd1234")
+        assert result["ratio"] is None
+        assert result["source"] == "unknown"
+
+    @patch("cli_agent_orchestrator.services.terminal_service.get_terminal_metadata")
+    def test_not_found(self, mock_get_metadata):
+        mock_get_metadata.return_value = None
+        from cli_agent_orchestrator.services.terminal_service import get_context_usage
+
+        with pytest.raises(ValueError, match="not found"):
+            get_context_usage("deadbeef")
+
+
 class TestSendInput:
     """Tests for send_input function."""
 

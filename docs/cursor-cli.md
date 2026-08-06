@@ -57,6 +57,23 @@ The PROCESSING check is **structural** — for older text-mode builds it walks b
 
 For v2026+ TUI detection, the tail of the rolling state buffer (last ~1KB) is consulted. The `ctrl+c to stop` indicator is always rendered in the last few hundred bytes of the input-box line on every Cursor TUI frame, so the 1KB window is well below the buffer cap (`state_buffer_max` server setting, 32KB by default) and the indicator is present whenever the agent is actively working.
 
+### Context usage (observe only)
+
+Cursor paints a **context percentage on the status bar** next to the model name, for example:
+
+```text
+GPT-5.6 Sol 272K Extra High · 13.2% · 28 files edited          Run Everything
+```
+
+CAO scrapes that footer via `CursorCliProvider.get_context_usage` and exposes it as:
+
+```bash
+curl "http://localhost:9889/terminals/{terminal_id}/context-usage"
+# {"terminal_id":"...","ratio":0.132,"source":"screen","provider":"cursor_cli"}
+```
+
+`ratio` is `null` / `source=unknown` when the footer is not visible (or for unsupported providers). This is **telemetry only** — CAO does not autocompact sessions.
+
 ### Message Extraction
 
 Cursor CLI does not emit a single canonical response marker (unlike Claude Code's `⏺`), so the provider uses the structural **separator + trailing prompt** pattern:
@@ -88,7 +105,16 @@ When launched with an agent profile (e.g., `--agents code_supervisor`), CAO:
 
 1. Loads the profile from the agent store (`~/.aws/cli-agent-orchestrator/agent-store`).
 2. Honors the profile's `model` field by passing `--model <id>` at launch (overridable via the constructor).
-3. For MCP servers: writes a synthetic Cursor plugin manifest under `~/.aws/cli-agent-orchestrator/tmp/<tid>-cursor-plugins/plugin.json` and passes the directory via `--plugin-dir`. The manifest's `mcpServers` map carries the `CAO_TERMINAL_ID` env var so MCP tools can identify the current terminal for handoff/assign operations. `--approve-mcps` is added so the REPL does not block on a per-server approval dialog.
+3. For MCP servers: writes a **marketplace-compatible** Cursor plugin under
+   `$CAO_HOME/tmp/<tid>-cursor-plugins/` and passes that directory via
+   `--plugin-dir`:
+   - `.cursor-plugin/plugin.json` — plugin metadata (`name`, `version`, …)
+   - `mcp.json` and `.mcp.json` — `{ "mcpServers": { … } }` with
+     `CAO_TERMINAL_ID` / `CAO_AGENT_DEPTH` in each server's `env`
+   A root-only `plugin.json` containing `mcpServers` is **not** valid and is
+   ignored by Cursor (the MCP picker would only show User servers from
+   `~/.cursor/mcp.json`). `--approve-mcps` is added so the REPL does not block
+   on a per-server approval dialog.
 4. **Does not** pass the profile body via `--system-prompt` in v2026.06.15: the backend rejects every request that carries a `--system-prompt <file>` payload with `[invalid_argument] unknown option '--system-prompt'` regardless of the file's contents (the bug is reproducible with a 3-character file). The CAO role context still reaches the agent via the `cao-mcp-server` MCP tool's handoff/assign payloads, so the agent has the right capabilities and the right inbox tools; only the role body is not pre-loaded as a system prompt. The preserved `_write_system_prompt_file` helper is ready to re-enable this path when Cursor ships a fixed client.
 
 ### Launch Command
@@ -201,9 +227,10 @@ If the supervisor completes the analysis work itself, the per-directory lock or 
    - The provider does **not** launch with `--trust` in v2026+ (Cursor rejects the flag in interactive REPL mode). The CAO launch flow's workspace-trust confirmation is sufficient.
    - If the dialog still appears, verify the `agent` (or `cursor-agent`) version supports `--force` (`agent --help`).
 
-2. **MCP Approval Dialog Blocking**
-   - The provider launches with `--approve-mcps` when the profile declares `mcpServers`, and the MCP servers are written into a `--plugin-dir` manifest.
-   - If MCP servers still prompt, check the synthesised `plugin.json` under `~/.aws/cli-agent-orchestrator/tmp/<tid>-cursor-plugins/`.
+2. **MCP Approval Dialog Blocking / CAO MCP missing from the list**
+   - The provider launches with `--approve-mcps` when the profile declares `mcpServers`, and servers are written into a marketplace-style `--plugin-dir` tree (`.cursor-plugin/plugin.json` + `mcp.json` / `.mcp.json`).
+   - If **cao-mcp-server never appears** (only User MCPs show), confirm the plugin dir layout under `$CAO_HOME/tmp/<tid>-cursor-plugins/` — root `plugin.json` alone is invalid and Cursor ignores it.
+   - If MCP servers still prompt for approval, check the same directory and that `--approve-mcps` is on the launch command.
 
 3. **Authentication Issues**
    ```bash

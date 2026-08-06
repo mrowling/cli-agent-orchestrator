@@ -20,9 +20,10 @@ relied on. The v2026 launch command the provider builds:
   ``composer-2.5``).
 - ``--plugin-dir <path>`` injects MCP server configuration. v2026
   removed the ``--mcp <json>`` flag in favour of ``--plugin-dir``
-  pointing at a directory holding Cursor plugin manifests. The
-  provider synthesises that directory from the agent profile's
-  ``mcpServers`` map at launch time.
+  pointing at a directory holding a Cursor plugin (marketplace
+  layout: ``.cursor-plugin/plugin.json`` + ``mcp.json`` /
+  ``.mcp.json``). The provider synthesises that directory from the
+  agent profile's ``mcpServers`` map at launch time.
 - ``--approve-mcps`` pre-approves MCP servers declared via
   ``--plugin-dir`` so the REPL does not block on a per-server
   approval dialog.
@@ -179,6 +180,49 @@ SEPARATOR_PATTERN = (
 # on the locale.
 TUI_PLACEHOLDER_PATTERN = r"(?:Plan, search, build anything|Add a follow-up)"
 TUI_STATUS_BAR_PATTERN = r"Run Everything|Composer \d"
+
+# Context-% on the Cursor status bar next to the model name, e.g.:
+#   GPT-5.6 Sol 272K Extra High · 13.2% · 28 files edited    Run Everything
+# Prefer lines with status chrome so body text like "100% tests passed" does
+# not win. Middot (·), bullet separators, and "files edited" / Run Everything
+# are the common anchors.
+_CONTEXT_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+_CONTEXT_STATUS_LINE_HINT_RE = re.compile(
+    r"(?:Run Everything|files edited|Composer \d"
+    r"|[\u00b7\u2022\u2219]\s*\d+(?:\.\d+)?\s*%"
+    r"|\d+(?:\.\d+)?\s*%\s*[\u00b7\u2022\u2219])",
+    re.IGNORECASE,
+)
+
+
+def _parse_cursor_context_usage(clean_text: str) -> Optional[float]:
+    """Extract context-window ratio from stripped Cursor TUI text.
+
+    Scans the last non-empty lines of the buffer for a percentage on a
+    status-oriented line. Returns a float in ``[0.0, 1.0]`` or ``None``.
+    """
+    if not clean_text:
+        return None
+    lines = [ln.rstrip() for ln in clean_text.splitlines() if ln.strip()]
+    if not lines:
+        return None
+    # Status bar lives at the bottom of the viewport; prefer recent lines.
+    for line in reversed(lines[-20:]):
+        if not _CONTEXT_STATUS_LINE_HINT_RE.search(line):
+            continue
+        match = _CONTEXT_PCT_RE.search(line)
+        if not match:
+            continue
+        try:
+            pct = float(match.group(1))
+        except ValueError:
+            continue
+        if pct < 0.0:
+            return None
+        # Allow slightly over 100 in case the TUI displays rounding absurdity;
+        # still report a clamped ratio.
+        return min(pct / 100.0, 1.0)
+    return None
 
 
 class CursorCliProvider(BaseProvider):
@@ -474,16 +518,26 @@ class CursorCliProvider(BaseProvider):
         """Materialise a Cursor plugin directory for the session's MCP servers.
 
         Cursor CLI v2026.06.15 dropped the ``--mcp <json>`` flag in
-        favour of ``--plugin-dir <path>``: a directory that holds
-        Cursor plugin manifests. We translate the CAO agent
-        profile's ``mcpServers`` map into a minimal manifest layout
-        so the same MCP servers (cao-mcp-server, ops-mcp-server,
-        etc.) start transparently under the new flag.
+        favour of ``--plugin-dir <path>``: a directory that holds a
+        real Cursor plugin (marketplace layout). We translate the CAO
+        agent profile's ``mcpServers`` map into that layout so the
+        same MCP servers (cao-mcp-server, ops-mcp-server, etc.) start
+        under the new flag.
+
+        Layout (matches marketplace plugins such as grafana-cloud-mcp)::
+
+            <tid>-cursor-plugins/
+              .cursor-plugin/plugin.json   # name, version, description
+              mcp.json                    # { "mcpServers": { ... } }
+              .mcp.json                   # same map (dual write)
+
+        A root-level ``plugin.json`` containing only ``mcpServers`` is
+        **not** a valid plugin and is ignored by Cursor (only User MCPs
+        from ``~/.cursor/mcp.json`` would appear).
 
         The synthesised directory lives under the CAO tmp dir keyed
         by the terminal id and is registered in ``self._tmp_paths``
-        so ``cleanup()`` deletes it (and the per-session manifest
-        inside it) when the session ends.
+        so ``cleanup()`` deletes it when the session ends.
 
         Args:
             mcp_servers: The agent profile's ``mcpServers`` map. Keys
@@ -496,6 +550,14 @@ class CursorCliProvider(BaseProvider):
         """
         plugin_dir = self._cao_tmp_dir() / f"{self.terminal_id}-cursor-plugins"
         plugin_dir.mkdir(parents=True, exist_ok=True)
+        # Drop the legacy invalid root plugin.json if present from an
+        # older session that reused the same terminal_id path.
+        legacy_root = plugin_dir / "plugin.json"
+        if legacy_root.is_file():
+            try:
+                legacy_root.unlink()
+            except OSError:
+                pass
 
         # CAO_TERMINAL_ID is forwarded into every server's env so
         # MCP tools (cao-mcp-server, ops-mcp-server) can resolve
@@ -519,16 +581,29 @@ class CursorCliProvider(BaseProvider):
                 env["CAO_AGENT_DEPTH"] = os.environ.get("CAO_AGENT_DEPTH", "0")
             servers[server_name]["env"] = env
 
-        # Cursor v2026 plugin manifests are JSON files inside the
-        # plugin dir. The exact schema is undocumented in the help
-        # text we captured; the minimum that the CLI accepts is a
-        # ``mcpServers`` object matching the well-known MCP config
-        # layout, written as ``plugin.json`` at the root. If the
-        # schema proves more strict in a later v2026 point release
-        # this layout can be tweaked without touching the rest of
-        # the provider.
-        manifest = {"mcpServers": servers}
-        (plugin_dir / "plugin.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        # Marketplace-compatible Cursor plugin layout. Metadata lives
+        # under .cursor-plugin/; MCP servers live in mcp.json (and
+        # .mcp.json for clients that read the dotted form).
+        cursor_meta_dir = plugin_dir / ".cursor-plugin"
+        cursor_meta_dir.mkdir(parents=True, exist_ok=True)
+        meta = {
+            "name": f"cao-session-{self.terminal_id}",
+            "displayName": "CAO session MCP",
+            "version": "0.1.0",
+            "description": (
+                f"CAO orchestrator MCP for terminal {self.terminal_id} "
+                f"(assign/handoff/send_message)."
+            ),
+            "author": {"name": "CLI Agent Orchestrator"},
+        }
+        (cursor_meta_dir / "plugin.json").write_text(
+            json.dumps(meta, indent=2) + "\n", encoding="utf-8"
+        )
+
+        mcp_manifest = json.dumps({"mcpServers": servers}, indent=2) + "\n"
+        (plugin_dir / "mcp.json").write_text(mcp_manifest, encoding="utf-8")
+        (plugin_dir / ".mcp.json").write_text(mcp_manifest, encoding="utf-8")
+
         self._register_tmp_path(plugin_dir)
         return str(plugin_dir)
 
@@ -859,6 +934,20 @@ class CursorCliProvider(BaseProvider):
 
         return TerminalStatus.UNKNOWN
 
+    def get_context_usage(self, buffer: str) -> Optional[float]:
+        """Parse context-window usage from the Cursor status bar footer.
+
+        Cursor paints a percentage next to the model name on the status
+        line, e.g. ``GPT-5.6 Sol · 13.2% · 28 files edited  Run Everything``.
+        Returns the ratio in ``[0.0, 1.0]`` when found, else ``None``.
+        """
+        if not buffer:
+            return None
+        buffer = self._resolve_buffer(buffer)
+        if not buffer:
+            return None
+        return _parse_cursor_context_usage(strip_terminal_escapes(buffer))
+
     def get_idle_pattern_for_log(self) -> str:
         """Return Cursor CLI IDLE prompt pattern for log files."""
         return IDLE_PROMPT_PATTERN_LOG
@@ -998,9 +1087,10 @@ class CursorCliProvider(BaseProvider):
         Resets the initialised flag and removes every per-session
         temp file the provider has created under the CAO tmp dir
         (system prompt file, plugin directory). Removing the
-        plugin directory also drops the per-session ``plugin.json``
-        manifest that forwards ``CAO_TERMINAL_ID`` into the MCP
-        server env.
+        plugin directory also drops the per-session Cursor plugin
+        layout (``.cursor-plugin/plugin.json``, ``mcp.json``,
+        ``.mcp.json``) that forwards ``CAO_TERMINAL_ID`` into the
+        MCP server env.
 
         Errors during cleanup are logged and swallowed — the
         session is already going away at this point and we do not

@@ -1361,3 +1361,35 @@ class TestKimiScreenDetection:
     def test_torn_down_shell_is_unknown(self):
         screen = ["Bye!", "rkram@host:/tmp/x$"]
         assert self._p().get_status_from_screen(screen) == TerminalStatus.UNKNOWN
+
+
+# =============================================================================
+# Context-usage scraping (context: N%)
+# =============================================================================
+
+
+class TestKimiGetContextUsage:
+    def _provider(self):
+        return KimiCliProvider("term-x", "session-x", "window-x", agent_profile="developer")
+
+    def test_context_footer_percent(self):
+        output = (
+            "── input ──────────────\n"
+            "23:14  yolo  agent (kimi-for-coding, thinking)  "
+            "ctrl-x: toggle mode  context: 12.3%\n"
+        )
+        assert self._provider().get_context_usage(output) == pytest.approx(0.123)
+
+    def test_context_with_token_counts(self):
+        output = "context: 4.0% (10.4k/262.1k)\n"
+        assert self._provider().get_context_usage(output) == pytest.approx(0.04)
+
+    def test_last_match_wins_when_stale_footer_present(self):
+        output = "context: 1.0%\nold response\ncontext: 9.5% (25k/262k)\n"
+        assert self._provider().get_context_usage(output) == pytest.approx(0.095)
+
+    def test_missing_footer_is_none(self):
+        assert self._provider().get_context_usage("hello world\n") is None
+
+    def test_empty_is_none(self):
+        assert self._provider().get_context_usage("") is None

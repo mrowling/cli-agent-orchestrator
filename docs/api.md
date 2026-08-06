@@ -72,6 +72,11 @@ See [Skills](skills.md) for discovery, installation, and catalog behavior.
 - `/sessions/{session_name}/terminals*` creates and lists session terminals.
 - `/terminals/{terminal_id}*` inspects terminals, sends input or keys, reads
   output and working-directory state, exits providers, and deletes terminals.
+- `GET /terminals/{terminal_id}/context-usage` returns scraped provider
+  context-window usage (`ratio` 0.0–1.0 from the TUI footer when known, else
+  `null` with `source=unknown`). Observe-only — CAO does not autocompact.
+  Cursor reports the status-bar `%` next to the model; Kimi reports
+  `context: N%`. Other providers return unknown until an adapter is added.
 - `GET /terminals/{terminal_id}/output?mode=full` returns the StatusMonitor
   rolling buffer (most recent `state_buffer_max` bytes of streamed output —
   server setting, 32KB by default, see [Configuration](configuration.md)),
