@@ -41,7 +41,7 @@ portable and make profile listings useful.
   profile frontmatter — never from tool arguments):
   - `store_lesson` — cross-agent lesson writes (built-in `retrospector`)
   - `get_terminal_transcript` — peer on-disk transcript reads (built-in
-    `reviewer_transcript`; D16)
+    `rook_transcript`; D16)
 - `tags` (array of strings): profile-discovery keywords, with at most 32 values;
   each value must match `A-Za-z0-9_-` and contain at most 64 characters.
 - `skills` (array of strings): exact names or case-sensitive
@@ -133,13 +133,13 @@ cao install https://raw.githubusercontent.com/awslabs/cli-agent-orchestrator/mai
 Packaged examples are available in the
 [agent store](https://github.com/awslabs/cli-agent-orchestrator/tree/main/src/cli_agent_orchestrator/agent_store).
 
-Built-in review lenses (D17) meant to be stacked by `code_supervisor`:
+Built-in review lenses meant to be stacked by `code_supervisor` (and chess-piece fleets):
 
-| Profile | Lens |
-| --- | --- |
-| `reviewer` | Code only (unchanged) |
-| `reviewer_transcript` | Worker transcript via `get_terminal_transcript` (D16) |
-| `reviewer_adversarial` | Code lens; supervisors pass a different `model=` on handoff/assign |
+| Profile | Lens | Default model (Cursor) |
+| --- | --- | --- |
+| `rook` | Constructive code review | `cursor-grok-4.5-high` |
+| `rook-adversarial` | Red-team / break-the-change review | `cursor-grok-4.5-high` |
+| `rook_transcript` | Worker transcript via `get_terminal_transcript` (D16) | (profile default / inherit) |
 
 ### Profile discovery
 

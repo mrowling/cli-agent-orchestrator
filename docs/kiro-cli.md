@@ -113,7 +113,7 @@ Kiro CLI always requires an agent profile. CAO passes it via:
 kiro-cli chat --agent {profile_name}
 ```
 
-The profile name determines the prompt pattern used for status detection. Built-in profiles include `developer` and `reviewer`.
+The profile name determines the prompt pattern used for status detection. Built-in profiles include `developer` and `rook`.
 
 ### Launch Command
 

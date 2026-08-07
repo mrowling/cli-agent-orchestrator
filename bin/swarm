@@ -10,6 +10,7 @@
 #   swarm stop                 # stop cao-server (optional: --sessions)
 #   swarm ui                   # open the Web UI in a browser
 #   swarm status               # print server health / pid / urls
+#   swarm export [opts]        # export every project memory scope
 #   swarm                      # fzf pick a piece, launch in $PWD
 #   swarm <piece> [cao args…]  # skip fzf; launch that piece in $PWD
 #   swarm king [slug] […]      # session name king-<slug> (default: basename $PWD)
@@ -42,6 +43,8 @@ LOG_FILE="${SWARM_STATE_DIR}/cao-server.log"
 API_HOST="${CAO_API_HOST:-127.0.0.1}"
 API_PORT="${CAO_API_PORT:-9889}"
 API_BASE="http://${API_HOST}:${API_PORT}"
+MEMORY_DIR="${CAO_HOME}/memory"
+GRAPH_EXPORT_DIR="${CAO_GRAPH_EXPORT_ROOT:-${CAO_HOME}/graph-exports}"
 
 usage() {
   cat <<EOF
@@ -50,6 +53,7 @@ Usage: swarm init                 # bd + .swarm/ policy files in \$PWD
        swarm stop [--sessions]     # stop cao-server (also cao shutdown --all)
        swarm ui                    # open Web UI (\$CAO_API_HOST:\$CAO_API_PORT)
        swarm status                # health / pid / urls
+       swarm export [opts]         # export every project memory scope
        swarm                       # fzf pick a piece, launch in \$PWD
        swarm <piece> [cao args…]   # skip fzf; launch that piece in \$PWD
        swarm king [slug] […]       # session king-<slug> for \$PWD (default: basename)
@@ -69,6 +73,13 @@ Server:
   stop --sessions              also run: cao shutdown --all
   ui                           open the production Web UI in a browser
   status                       print whether the server is up
+
+Memory export:
+  export                       export every project scope under \$CAO_HOME_DIR/memory
+  export -o DIR                write OKF bundles under DIR (default: ./memory-export)
+  export --obsidian            Obsidian vaults under graph-exports/ (needs cao-server)
+  export --also-global         also export global (+ federated if present)
+  export --dry-run             list projects / destinations; write nothing
 
 Pieces:
   king                         supervisor — plan / delegate (never code; Claude Code)
@@ -90,6 +101,7 @@ Env:
   CAO_SWARM_ROOT               chess-pieces example root (default: <repo>/examples/chess-pieces)
   CAO_HOME_DIR                 CAO home (profiles under \$CAO_HOME_DIR/agent-store)
   CAO_API_HOST / CAO_API_PORT  server host/port (default: 127.0.0.1:9889)
+  CAO_GRAPH_EXPORT_ROOT        Obsidian/export root (default: \$CAO_HOME_DIR/graph-exports)
   SWARM_CONFIRM=1              keep cao launch confirmation prompt
   SWARM_YOLO=1                 pass --yolo to cao launch
 EOF
@@ -339,6 +351,217 @@ cmd_ui() {
   fi
 }
 
+# Project scope_ids = top-level dirs under memory/ that are not reserved containers.
+list_project_scope_ids() {
+  local mem_dir="${1:-$MEMORY_DIR}"
+  local d name
+  if [[ ! -d "$mem_dir" ]]; then
+    return 0
+  fi
+  # shellcheck disable=SC2012
+  for d in "$mem_dir"/*/; do
+    [[ -d "$d" ]] || continue
+    name="$(basename "$d")"
+    case "$name" in
+      global|federated|logs) continue ;;
+    esac
+    # Prefer dirs that look like real project stores (wiki/ present).
+    if [[ -d "$d/wiki" ]] || [[ -d "$d/wiki/project" ]]; then
+      printf '%s\n' "$name"
+    fi
+  done | LC_ALL=C sort -u
+}
+
+# Safe bundle/vault name for a scope_id (filesystem-friendly).
+export_dest_name() {
+  local kind="$1" scope_id="$2"
+  # Keep alnum, dot, underscore, hyphen; map everything else to '-'.
+  local safe
+  safe="$(printf '%s' "$scope_id" | tr -c 'A-Za-z0-9._-' '-' | sed -E 's/-+/-/g; s/^-+//; s/-+$//')"
+  [[ -n "$safe" ]] || safe="unknown"
+  printf '%s-%s' "$kind" "$safe"
+}
+
+urlencode() {
+  # Minimal encoder for scope_id path query values (alnum + common punctuation).
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"
+  else
+    # Fallback: only use raw when already safe.
+    printf '%s' "$1"
+  fi
+}
+
+export_one_okf() {
+  local scope="$1" scope_id="${2:-}" dest="$3"
+  if [[ "$scope" == "project" ]]; then
+    CAO_PROJECT_ID="$scope_id" cao memory export --scope project -o "$dest"
+  else
+    cao memory export --scope "$scope" -o "$dest"
+  fi
+}
+
+export_one_obsidian() {
+  local scope="$1" scope_id="${2:-}" dest_name="$3"
+  local qs="scope=${scope}"
+  if [[ -n "$scope_id" ]]; then
+    qs="${qs}&scope_id=$(urlencode "$scope_id")"
+  fi
+  local body resp http_code
+  body="$(printf '{"sink":"obsidian","dest":%s,"options":{}}' "$(python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$dest_name" 2>/dev/null || printf '"%s"' "$dest_name")")"
+  resp="$(
+    curl -sS -w '\n%{http_code}' -X POST \
+      "${API_BASE}/graph/memory/export?${qs}" \
+      -H 'Content-Type: application/json' \
+      -d "$body"
+  )" || {
+    echo "error: curl failed for scope=$scope scope_id=${scope_id:-}" >&2
+    return 1
+  }
+  http_code="$(printf '%s' "$resp" | tail -n1)"
+  local payload
+  payload="$(printf '%s' "$resp" | sed '$d')"
+  if [[ "$http_code" != "200" ]]; then
+    echo "error: export HTTP $http_code scope=$scope scope_id=${scope_id:-}" >&2
+    echo "$payload" >&2
+    return 1
+  fi
+  echo "swarm: obsidian → ${GRAPH_EXPORT_DIR}/${dest_name}"
+}
+
+cmd_export() {
+  local out_dir="./memory-export"
+  local also_global=0
+  local dry_run=0
+  local mode="okf" # okf | obsidian
+
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -o|--output)
+        [[ $# -ge 2 ]] || { echo "error: $1 requires a path" >&2; exit 1; }
+        out_dir="$2"
+        shift 2
+        ;;
+      --obsidian)
+        mode="obsidian"
+        shift
+        ;;
+      --okf)
+        mode="okf"
+        shift
+        ;;
+      --also-global|--global)
+        also_global=1
+        shift
+        ;;
+      --dry-run)
+        dry_run=1
+        shift
+        ;;
+      -h|--help)
+        usage 0
+        ;;
+      *)
+        echo "error: unknown export option: $1" >&2
+        usage 1
+        ;;
+    esac
+  done
+
+  echo "swarm: CAO_HOME=$CAO_HOME" >&2
+  echo "swarm: memory dir=$MEMORY_DIR" >&2
+
+  local -a projects=()
+  local id
+  while IFS= read -r id; do
+    [[ -n "$id" ]] || continue
+    projects+=("$id")
+  done < <(list_project_scope_ids "$MEMORY_DIR")
+
+  if [[ ${#projects[@]} -eq 0 ]]; then
+    echo "swarm: no project scopes found under $MEMORY_DIR" >&2
+    if [[ "$also_global" -eq 0 ]]; then
+      echo "hint: set CAO_HOME_DIR if memory lives elsewhere; or pass --also-global" >&2
+      exit 1
+    fi
+  else
+    echo "swarm: found ${#projects[@]} project scope(s)" >&2
+  fi
+
+  if [[ "$dry_run" -eq 1 ]]; then
+    local dest
+    if [[ "$also_global" -eq 1 ]]; then
+      if [[ "$mode" == "obsidian" ]]; then
+        echo "dry-run: global → ${GRAPH_EXPORT_DIR}/global-vault"
+        echo "dry-run: federated → ${GRAPH_EXPORT_DIR}/federated-vault (if any)"
+      else
+        echo "dry-run: global → ${out_dir}/global"
+        echo "dry-run: federated → ${out_dir}/federated"
+      fi
+    fi
+    for id in "${projects[@]+"${projects[@]}"}"; do
+      dest="$(export_dest_name project "$id")"
+      if [[ "$mode" == "obsidian" ]]; then
+        echo "dry-run: project scope_id=$id → ${GRAPH_EXPORT_DIR}/${dest}"
+      else
+        echo "dry-run: project scope_id=$id → ${out_dir}/${dest}"
+      fi
+    done
+    return 0
+  fi
+
+  if [[ "$mode" == "obsidian" ]]; then
+    need_cmd curl
+    if ! server_healthy; then
+      echo "error: cao-server not reachable at ${API_BASE}" >&2
+      echo "hint: run 'swarm start' first (Obsidian export uses the graph API)" >&2
+      exit 1
+    fi
+  else
+    need_cmd cao
+  fi
+
+  local failed=0
+  local dest
+
+  if [[ "$also_global" -eq 1 ]]; then
+    if [[ "$mode" == "obsidian" ]]; then
+      export_one_obsidian global "" "global-vault" || failed=1
+      # federated is optional; ignore empty/missing
+      export_one_obsidian federated "" "federated-vault" || true
+    else
+      mkdir -p "$out_dir"
+      export_one_okf global "" "${out_dir}/global" || failed=1
+      export_one_okf federated "" "${out_dir}/federated" || true
+    fi
+  fi
+
+  for id in "${projects[@]+"${projects[@]}"}"; do
+    dest="$(export_dest_name project "$id")"
+    echo "swarm: exporting project scope_id=$id" >&2
+    if [[ "$mode" == "obsidian" ]]; then
+      export_one_obsidian project "$id" "$dest" || failed=1
+    else
+      mkdir -p "$out_dir"
+      if ! export_one_okf project "$id" "${out_dir}/${dest}"; then
+        echo "error: failed OKF export for project $id" >&2
+        failed=1
+      fi
+    fi
+  done
+
+  if [[ "$failed" -ne 0 ]]; then
+    echo "error: one or more exports failed" >&2
+    exit 1
+  fi
+
+  if [[ "$mode" == "obsidian" ]]; then
+    echo "swarm: Obsidian vaults under $GRAPH_EXPORT_DIR" >&2
+  else
+    echo "swarm: OKF bundles under $out_dir" >&2
+  fi
+}
+
 # Read provider: / model: from profile frontmatter (installed or example md).
 field_for() {
   local piece="$1" key="$2"
@@ -545,6 +768,10 @@ case "$PIECE" in
   status)
     shift || true
     cmd_status "$@"
+    ;;
+  export)
+    shift || true
+    cmd_export "$@"
     ;;
   "")
     PIECE="$(pick_piece)"

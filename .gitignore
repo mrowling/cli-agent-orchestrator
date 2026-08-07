@@ -51,6 +51,7 @@ work/
 
 # Memory
 context/
+memory-export/
 
 # Worktrees
 .worktrees
@@ -60,3 +61,5 @@ aidlc-docs
 
 # Separate git repos (not part of this project)
 cao-flows/
+
+.swarm/

@@ -51,9 +51,9 @@ def capable_caller():
 
     def _get_meta(tid):
         if tid == CALLER_CAPABLE:
-            return _meta("reviewer_transcript")
+            return _meta("rook_transcript")
         if tid == CALLER_INCAPABLE:
-            return _meta("reviewer")
+            return _meta("rook")
         return None
 
     with (
@@ -65,7 +65,7 @@ def capable_caller():
     ):
 
         def _load(name):
-            caps = ["get_terminal_transcript"] if name == "reviewer_transcript" else ["review"]
+            caps = ["get_terminal_transcript"] if name == "rook_transcript" else ["review"]
             return MagicMock(capabilities=caps, name=name)
 
         mock_load.side_effect = _load
@@ -109,7 +109,7 @@ class TestTranscriptRoute:
         mock_svc.read_terminal_transcript.assert_not_called()
 
     def test_capable_caller_profile_allowed(self, client, capable_caller):
-        """reviewer_transcript capability → 200."""
+        """rook_transcript capability → 200."""
         payload = {
             "output": "hello",
             "truncated": False,

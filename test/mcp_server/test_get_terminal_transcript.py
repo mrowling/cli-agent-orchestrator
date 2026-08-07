@@ -13,11 +13,11 @@ from cli_agent_orchestrator.mcp_server.server import (
 
 
 class TestTranscriptCapabilityHelper:
-    def test_reviewer_transcript_has_capability(self):
-        assert _caller_has_get_terminal_transcript_capability("reviewer_transcript") is True
+    def test_rook_transcript_has_capability(self):
+        assert _caller_has_get_terminal_transcript_capability("rook_transcript") is True
 
-    def test_reviewer_does_not(self):
-        assert _caller_has_get_terminal_transcript_capability("reviewer") is False
+    def test_rook_does_not(self):
+        assert _caller_has_get_terminal_transcript_capability("rook") is False
 
     def test_missing_profile_fails_closed(self):
         assert _caller_has_get_terminal_transcript_capability("no-such-profile") is False
@@ -66,7 +66,7 @@ class TestGetTerminalTranscriptTool:
             patch.object(
                 srv,
                 "_get_terminal_context_from_env",
-                return_value=self._ctx("reviewer_transcript"),
+                return_value=self._ctx("rook_transcript"),
             ),
             patch.object(srv, "_caller_has_get_terminal_transcript_capability", return_value=True),
             patch(
@@ -102,7 +102,7 @@ class TestGetTerminalTranscriptTool:
             patch.object(
                 srv,
                 "_get_terminal_context_from_env",
-                return_value=self._ctx("reviewer_transcript"),
+                return_value=self._ctx("rook_transcript"),
             ),
             patch.object(srv, "_caller_has_get_terminal_transcript_capability", return_value=True),
             patch(

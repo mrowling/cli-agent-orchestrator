@@ -117,6 +117,23 @@ swarm stop --sessions       # also: cao shutdown --all
 Logs/pid live under `~/.aws/cli-agent-orchestrator/swarm/` (or `$CAO_HOME_DIR/swarm`).
 Override bind address with `CAO_API_HOST` / `CAO_API_PORT`. Foreground: `swarm start --fg`.
 
+## Memory export
+
+Export every **project** memory scope under `$CAO_HOME_DIR/memory` (skips
+`global` / `federated` / `logs` containers unless you ask):
+
+```bash
+swarm export                         # OKF bundles → ./memory-export/project-<id>/
+swarm export -o ~/cao-memory-export  # custom output directory
+swarm export --also-global           # also global (+ federated if present)
+swarm export --obsidian              # Obsidian vaults via graph API (needs swarm start)
+swarm export --dry-run               # list dests only
+```
+
+`CAO_HOME_DIR` must point at the home that holds your real memory tree
+(default `~/.aws/cli-agent-orchestrator`). Obsidian mode writes under
+`$CAO_GRAPH_EXPORT_ROOT` (default `$CAO_HOME_DIR/graph-exports`).
+
 ## Launch pieces
 
 Interactive picker (fzf) — always launches in **`$PWD`**:

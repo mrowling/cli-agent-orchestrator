@@ -32,7 +32,7 @@ Subsequent launches complete in ~2 seconds.
 # Built-in profiles
 cao install code_supervisor --provider opencode_cli
 cao install developer --provider opencode_cli
-cao install reviewer --provider opencode_cli
+cao install rook --provider opencode_cli
 
 # Custom or example profiles
 cao install examples/assign/data_analyst.md --provider opencode_cli

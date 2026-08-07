@@ -302,7 +302,7 @@ Supervisor (role: supervisor → @cao-mcp-server, fs_read, fs_list)
   │    → Developer profile: role: developer → full access
   │    → Claude Code launched with no --disallowedTools
   │
-  └─ handoff("reviewer")
+  └─ handoff("rook")
        → Reviewer profile: role: reviewer → read-only
        → Claude Code launched with --disallowedTools Bash Edit Write
 ```

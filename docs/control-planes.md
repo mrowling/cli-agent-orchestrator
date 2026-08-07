@@ -92,7 +92,7 @@ The current tools are grouped by purpose:
 For **in-session** peer transcript review (capability-gated
 `get_terminal_transcript` on `cao-mcp-server`, reading on-disk `.log` /
 `.scrollback` via `GET /terminals/{id}/transcript`), see [API](api.md) and
-the `reviewer_transcript` profile (D16/D17). That tool is not part of
+the `rook_transcript` profile (D16). That tool is not part of
 `cao-ops-mcp`; ops inspection remains the operator-facing surface above.
 
 MCP tool discovery is authoritative for clients. The declarations in

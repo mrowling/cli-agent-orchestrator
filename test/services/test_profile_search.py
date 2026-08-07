@@ -229,10 +229,10 @@ class TestEndToEndWiring:
     @pytest.mark.parametrize(
         ("query", "expected_profile"),
         [
+            ("constructive code review maintainability", "rook"),
+            ("adversarial review break failure modes", "rook-adversarial"),
             ("implement Python API pytest tests", "developer"),
             ("create edit technical documentation docx", "developer"),
-            ("review AWS CDK infrastructure", "reviewer"),
-            ("review code security correctness", "reviewer"),
         ],
     )
     def test_documented_queries_find_shipped_profiles_in_clean_home(

@@ -235,7 +235,7 @@ def summarize(filename: str):
         # RETURNS its summary inline (R3) — it does not write files.
         handle = run_step(
             provider="claude_code",          # headless (R5)
-            agent="reviewer",
+            agent="rook",
             prompt=f"Summarize the file at {path} in 3 bullet points. Return the summary only.",
             step_id=f"summarize:{filename}",
         )

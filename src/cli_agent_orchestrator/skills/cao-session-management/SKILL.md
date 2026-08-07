@@ -56,12 +56,12 @@ This example assumes a configured CAO setup (server running, profiles installed)
 # Provider-agnostic: `cao install` works for any provider.
 cao install code_supervisor
 cao install developer
-cao install reviewer
+cao install rook
 
 # Launch headlessly (assumes cao-server is already running)
 cao launch --agents code_supervisor --headless --yolo \
   --session-name my-task --working-directory '/path/to/project' \
-  "Build a hello-world Python script. Delegate to developer, then reviewer."
+  "Build a hello-world Python script. Delegate to developer, then rook."
 
 # Same launch on a different provider
 # cao launch --agents code_supervisor --provider claude_code --headless --yolo \

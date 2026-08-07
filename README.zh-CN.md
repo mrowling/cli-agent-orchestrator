@@ -140,7 +140,7 @@ CAO 驱动的是已有 CLI Agent 工具，它并不会替代这些工具。使�
 ```bash
 cao install code_supervisor      # 负责委派 worker 的 supervisor
 cao install developer            # 可选 worker
-cao install reviewer             # 可选 worker
+cao install rook                 # 可选 worker（代码审查）
 ```
 
 也可以从本地文件或 URL 安装 Agent：

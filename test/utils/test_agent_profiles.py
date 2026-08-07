@@ -313,8 +313,8 @@ class TestListAgentProfiles:
         mock_file1.name = "developer.md"
         mock_file1.read_text.return_value = "---\ndescription: Developer agent\n---\nPrompt"
         mock_file2 = MagicMock()
-        mock_file2.name = "reviewer.md"
-        mock_file2.read_text.return_value = "---\ndescription: Reviewer agent\n---\nPrompt"
+        mock_file2.name = "rook.md"
+        mock_file2.read_text.return_value = "---\ndescription: Rook reviewer agent\n---\nPrompt"
         mock_agent_store = MagicMock()
         mock_agent_store.iterdir.return_value = [mock_file1, mock_file2]
         mock_resources.files.return_value = mock_agent_store
@@ -327,7 +327,7 @@ class TestListAgentProfiles:
         # Verify built-in profiles are present with correct source
         names = {p["name"] for p in result}
         assert "developer" in names
-        assert "reviewer" in names
+        assert "rook" in names
         for p in result:
             assert p["source"] == "built-in"
 

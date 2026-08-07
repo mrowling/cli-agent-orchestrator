@@ -61,7 +61,7 @@ command -v claude >/dev/null 2>&1 || warn "claude CLI missing — install (npm i
 
 # 6. db + profiles (idempotent)
 cao init || true
-for p in code_supervisor developer reviewer; do
+for p in code_supervisor developer rook rook-adversarial rook_transcript; do
   cao install "$p" --provider claude_code || warn "profile $p install skipped"
 done
 
